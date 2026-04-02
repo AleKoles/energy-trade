@@ -46,7 +46,7 @@ The portal isn't just a data entry tool; it’s a trading assistant. It features
 
 1.  **Clone the repo:**
     ```bash
-    git clone [https://github.com/your-username/green-spot-auction.git](https://github.com/your-username/green-spot-auction.git)
+    git clone [https://github.com/AleKoles/gs.git](https://github.com/AleKoles/gs.git)
     ```
 2.  **Install dependencies:**
     ```bash
