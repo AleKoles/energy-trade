@@ -1,0 +1,1687 @@
+"use client"
+
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+} from "react"
+import { AnimatePresence, motion } from "framer-motion"
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  Copy,
+  Leaf,
+  Moon,
+  MoreHorizontal,
+  RefreshCw,
+  Sun,
+  Upload,
+  X,
+  Zap,
+} from "lucide-react"
+import { List as VirtualList } from "react-window"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+import { cn } from "@/lib/utils"
+import { generateReferencePrices } from "@/lib/pricing"
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface HourlyBidRow {
+  hour: string
+  volume: number    // MW (user input)
+  price: number | null  // €/MWh — null = not yet entered
+  // State is derived: empty (no values) | draft (one field) | active (both fields)
+}
+
+/** Derived from volume + price — never stored directly */
+type RowState = 'empty' | 'draft' | 'active'
+
+type MarketType = "day-ahead" | "intraday"
+type BidField = "volume" | "price"
+type SectionId = "night" | "morning" | "day" | "evening"
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const STORAGE_KEY = "greenspot-bid-draft"
+const MOBILE_ROW_H = 124
+
+const SECTIONS: Array<{
+  id: SectionId
+  label: string
+  timeRange: string
+  hourStart: number
+  hourEnd: number // exclusive
+  icon: typeof Moon
+}> = [
+  { id: "night",   label: "Night",   timeRange: "00:00 – 06:00", hourStart: 0,  hourEnd: 6,  icon: Moon },
+  { id: "morning", label: "Morning", timeRange: "06:00 – 12:00", hourStart: 6,  hourEnd: 12, icon: Sun  },
+  { id: "day",     label: "Day",     timeRange: "12:00 – 18:00", hourStart: 12, hourEnd: 18, icon: Sun  },
+  { id: "evening", label: "Evening", timeRange: "18:00 – 24:00", hourStart: 18, hourEnd: 24, icon: Moon },
+]
+
+const STEPS = [
+  { id: 1, label: "Setup",     description: "Market & session settings" },
+  { id: 2, label: "Bid Entry", description: "Enter hourly bids" },
+  { id: 3, label: "Review",    description: "Confirm and submit" },
+]
+
+type DataSource = "session" | "scratch" | "csv"
+
+const HOURS = Array.from({ length: 24 }, (_, i) => {
+  const start = i.toString().padStart(2, "0")
+  const end = ((i + 1) % 24).toString().padStart(2, "0")
+  return `${start}:00 - ${end}:00`
+})
+
+function generateIntradayLabels(): string[] {
+  const labels: string[] = []
+  for (let i = 0; i < 96; i++) {
+    const totalMin = i * 15
+    const h = Math.floor(totalMin / 60) % 24
+    const m = totalMin % 60
+    labels.push(`${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`)
+  }
+  return labels
+}
+
+const INTRADAY_LABELS = generateIntradayLabels()
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function slotLabelsFor(mt: MarketType): string[] {
+  return mt === "intraday" ? INTRADAY_LABELS : HOURS
+}
+
+function createDefaultBids(mt: MarketType): HourlyBidRow[] {
+  return slotLabelsFor(mt).map((hour) => ({ hour, volume: 0, price: null }))
+}
+
+function getRowState(row: HourlyBidRow): RowState {
+  const hasVolume = row.volume > 0
+  const hasPrice = row.price !== null
+  if (hasVolume && hasPrice) return 'active'
+  if (hasVolume || hasPrice) return 'draft'
+  return 'empty'
+}
+
+function expand24To96(rows: HourlyBidRow[]): HourlyBidRow[] {
+  const out: HourlyBidRow[] = []
+  for (let h = 0; h < 24; h++) {
+    const b = rows[h]
+    const slotVolume = b.volume > 0 ? b.volume / 4 : 0
+    for (let q = 0; q < 4; q++) {
+      out.push({ hour: INTRADAY_LABELS[h * 4 + q], volume: slotVolume, price: b.price })
+    }
+  }
+  return out
+}
+
+function collapse96To24(rows: HourlyBidRow[]): HourlyBidRow[] {
+  const out: HourlyBidRow[] = []
+  for (let h = 0; h < 24; h++) {
+    let vol = 0, pricedVol = 0, weightedPrice = 0
+    let firstPrice: number | null = null
+    for (let q = 0; q < 4; q++) {
+      const b = rows[h * 4 + q]
+      vol += b.volume
+      if (b.price !== null) {
+        weightedPrice += b.volume * b.price
+        pricedVol += b.volume
+        if (firstPrice === null) firstPrice = b.price
+      }
+    }
+    const price = pricedVol > 0 ? weightedPrice / pricedVol : firstPrice
+    out.push({ hour: HOURS[h], volume: vol, price })
+  }
+  return out
+}
+
+function parseDraft(raw: string | null): {
+  hourlyBids: HourlyBidRow[]
+  marketType: MarketType
+  currentStep: number
+} | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as {
+      hourlyBids?: HourlyBidRow[]
+      marketType?: MarketType
+      currentStep?: number
+    }
+    if (!Array.isArray(parsed.hourlyBids)) return null
+    const len = parsed.hourlyBids.length
+    if (len !== 24 && len !== 96) return null
+    const mt0: MarketType =
+      parsed.marketType === "intraday" || parsed.marketType === "day-ahead"
+        ? parsed.marketType : "day-ahead"
+    let hourlyBids: HourlyBidRow[] = parsed.hourlyBids.map((row, i) => ({
+      hour: typeof row.hour === "string" ? row.hour : slotLabelsFor(mt0)[i] ?? HOURS[i % 24],
+      volume: typeof row.volume === "number" && !Number.isNaN(row.volume) ? row.volume : 0,
+      price: typeof row.price === "number" && !Number.isNaN(row.price) ? row.price : null,
+      // active field is derived — ignore any stored value
+    }))
+    if (mt0 === "intraday" && hourlyBids.length === 24) hourlyBids = expand24To96(hourlyBids)
+    else if (mt0 === "day-ahead" && hourlyBids.length === 96) hourlyBids = collapse96To24(hourlyBids)
+    const currentStep =
+      typeof parsed.currentStep === "number" && parsed.currentStep >= 1 && parsed.currentStep <= 3
+        ? parsed.currentStep : 2
+    return { hourlyBids, marketType: mt0, currentStep }
+  } catch { return null }
+}
+
+function getSlotSection(index: number, isIntraday: boolean): SectionId {
+  const hour = isIntraday ? Math.floor(index / 4) : index
+  if (hour < 6) return "night"
+  if (hour < 12) return "morning"
+  if (hour < 18) return "day"
+  return "evening"
+}
+
+function getSectionSlotRange(sec: (typeof SECTIONS)[number], isIntraday: boolean): [number, number] {
+  const mult = isIntraday ? 4 : 1
+  return [sec.hourStart * mult, sec.hourEnd * mult - 1]
+}
+
+// ─── Sub-components ──────────────────────────────────────────────────────────
+
+function OtarkStepIndicator({
+  isCompleted,
+  isCurrent,
+}: {
+  stepId: number
+  isCompleted: boolean
+  isCurrent: boolean
+}) {
+  if (isCompleted) {
+    return (
+      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm">
+        <Check className="h-4 w-4" strokeWidth={2.5} />
+      </div>
+    )
+  }
+  if (isCurrent) {
+    return (
+      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary shadow-sm">
+        <span className="h-2.5 w-2.5 rounded-full bg-white/90" />
+      </div>
+    )
+  }
+  return <div className="h-8 w-8 shrink-0 rounded-full border border-gray-200 bg-white" />
+}
+
+function OtarkCheckbox({
+  checked,
+  onChange,
+  ariaLabel,
+}: {
+  checked: boolean
+  onChange: (next: boolean) => void
+  ariaLabel: string
+}) {
+  return (
+    <label className="relative inline-flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-gray-300 bg-white transition-colors focus-within:ring-2 focus-within:ring-primary/30 has-[:checked]:border-primary has-[:checked]:bg-primary">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="peer sr-only"
+        aria-label={ariaLabel}
+      />
+      <Check className="pointer-events-none h-2.5 w-2.5 text-white opacity-0 peer-checked:opacity-100" strokeWidth={3} />
+    </label>
+  )
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+export function GreenSpotAuction() {
+  const [currentStep, setCurrentStep] = useState(1)
+  const [marketType, setMarketType] = useState<MarketType>("day-ahead")
+  const [hourlyBids, setHourlyBids] = useState<HourlyBidRow[]>(() => createDefaultBids("day-ahead"))
+  const [isOpen, setIsOpen] = useState(true)
+  const [draftHydrated, setDraftHydrated] = useState(false)
+  const [draftSaved, setDraftSaved] = useState(false)
+  const [isMobile, setIsMobile] = useState(false)
+  const [listHeight, setListHeight] = useState(400)
+  const [mobileFocusIndex, setMobileFocusIndex] = useState<number | null>(null)
+  const [flashedRows, setFlashedRows] = useState<ReadonlySet<number>>(new Set())
+  const [selectedRows, setSelectedRows] = useState<ReadonlySet<number>>(new Set())
+  const [collapsedSections, setCollapsedSections] = useState<ReadonlySet<SectionId>>(new Set())
+  const [dataSource, setDataSource] = useState<DataSource>("session")
+  const [submitted, setSubmitted] = useState(false)
+
+  const draftSavedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mobileFieldRef = useRef<BidField>("volume")
+  const listWrapRef = useRef<HTMLDivElement>(null)
+  const blurClearRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const isIntraday = marketType === "intraday"
+  const mwhMultiplier = isIntraday ? 0.25 : 1
+  const slotCount = hourlyBids.length
+
+  // Reference prices — stable per market type (wind factor baked in once per switch)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const refPrices = useMemo(() => generateReferencePrices(isIntraday), [marketType])
+
+  // Gate closure warning: true if current CET time is within 30 min of 11:00
+  const nearClosure = useMemo(() => {
+    try {
+      const now = new Date()
+      const parts = new Intl.DateTimeFormat("en", {
+        timeZone: "Europe/Paris",
+        hour: "numeric", minute: "numeric", hour12: false,
+      }).formatToParts(now)
+      const h = parseInt(parts.find((p) => p.type === "hour")?.value ?? "0")
+      const m = parseInt(parts.find((p) => p.type === "minute")?.value ?? "0")
+      const diff = 11 * 60 - (h * 60 + m)
+      return diff > 0 && diff <= 30
+    } catch { return false }
+  }, [])
+
+  // Count incomplete (draft) rows for Continue hint
+  const draftCount = useMemo(
+    () => hourlyBids.filter((b) => getRowState(b) === "draft").length,
+    [hourlyBids]
+  )
+
+  // ── Effects ────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 767px)")
+    const apply = () => setIsMobile(mq.matches)
+    apply()
+    mq.addEventListener("change", apply)
+    return () => mq.removeEventListener("change", apply)
+  }, [])
+
+  useLayoutEffect(() => {
+    const el = listWrapRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setListHeight(Math.max(200, el.clientHeight)))
+    ro.observe(el)
+    setListHeight(Math.max(200, el.clientHeight))
+    return () => ro.disconnect()
+  }, [isMobile, hourlyBids.length])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const draft = parseDraft(localStorage.getItem(STORAGE_KEY))
+    if (draft) {
+      setHourlyBids(draft.hourlyBids)
+      setMarketType(draft.marketType)
+      setCurrentStep(draft.currentStep)
+    }
+    setDraftHydrated(true)
+  }, [])
+
+  useEffect(() => {
+    if (!draftHydrated || typeof window === "undefined") return
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hourlyBids, marketType, currentStep }))
+    if (draftSavedTimerRef.current) clearTimeout(draftSavedTimerRef.current)
+    setDraftSaved(true)
+    draftSavedTimerRef.current = setTimeout(() => setDraftSaved(false), 1800)
+  }, [hourlyBids, marketType, currentStep, draftHydrated])
+
+  // ── Derived ────────────────────────────────────────────────────────────────
+
+  const { totalVolume, estimatedMaxSpend, filledSlots } = useMemo(() => {
+    let vol = 0, spend = 0, filled = 0
+    for (let i = 0; i < hourlyBids.length; i++) {
+      const bid = hourlyBids[i]
+      // Active = both volume and price provided
+      if (bid.volume > 0 && bid.price !== null) {
+        const mwh = bid.volume * mwhMultiplier
+        vol += mwh
+        spend += mwh * bid.price
+        filled++
+      } else if (bid.volume > 0) {
+        // Draft (volume only): include in spend estimate using reference price fallback
+        spend += bid.volume * mwhMultiplier * (refPrices[i] ?? 0)
+      }
+    }
+    return { totalVolume: vol, estimatedMaxSpend: spend, filledSlots: filled }
+  }, [hourlyBids, mwhMultiplier, refPrices])
+
+  // At least one row with both fields filled
+  const canContinue = useMemo(
+    () => hourlyBids.some((b) => b.volume > 0 && b.price !== null),
+    [hourlyBids]
+  )
+
+  // ── Handlers ──────────────────────────────────────────────────────────────
+
+  const updateBidRow = useCallback((index: number, patch: Partial<HourlyBidRow>) => {
+    setHourlyBids((prev) => {
+      const next = [...prev]
+      next[index] = { ...next[index], ...patch }
+      return next
+    })
+  }, [])
+
+  const handleMarketTypeChange = useCallback((next: MarketType) => {
+    if (next === marketType) return
+    setHourlyBids((prev) => {
+      if (next === "intraday" && prev.length === 24) return expand24To96(prev)
+      if (next === "day-ahead" && prev.length === 96) return collapse96To24(prev)
+      return createDefaultBids(next)
+    })
+    setMarketType(next)
+    setSelectedRows(new Set())
+  }, [marketType])
+
+  const handleVolumeChange = (index: number, raw: string) => {
+    if (raw === "" || raw === "-") { updateBidRow(index, { volume: 0 }); return }
+    const n = parseFloat(raw)
+    updateBidRow(index, { volume: Number.isNaN(n) ? 0 : n })
+  }
+
+  const handlePriceChange = (index: number, raw: string) => {
+    if (raw === "") { updateBidRow(index, { price: null }); return }
+    const n = parseFloat(raw)
+    if (!Number.isNaN(n)) updateBidRow(index, { price: n })
+  }
+
+  const focusNextRowField = (index: number, field: BidField) => {
+    if (index >= slotCount - 1) return
+    document.querySelector<HTMLInputElement>(`[data-bid-input="${field}-${index + 1}"]`)?.focus()
+  }
+
+  const handleBidKeyDown = (e: KeyboardEvent<HTMLInputElement>, index: number, field: BidField) => {
+    if (e.key === "ArrowDown" || e.key === "Enter") {
+      e.preventDefault()
+      focusNextRowField(index, field)
+    }
+    if (e.key === "Tab" && !e.shiftKey && field === "price" && index < slotCount - 1) {
+      e.preventDefault()
+      document.querySelector<HTMLInputElement>(`[data-bid-input="volume-${index + 1}"]`)?.focus()
+    }
+    if (e.key === "Tab" && e.shiftKey && field === "volume" && index > 0) {
+      e.preventDefault()
+      document.querySelector<HTMLInputElement>(`[data-bid-input="price-${index - 1}"]`)?.focus()
+    }
+  }
+
+  const focusHourAtField = useCallback((index: number, field: BidField) => {
+    if (index < 0 || index >= slotCount) return
+    mobileFieldRef.current = field
+    document.querySelector<HTMLInputElement>(`[data-bid-input="${field}-${index}"]`)?.focus()
+  }, [slotCount])
+
+  const handleMobileInputFocus = (index: number, field: BidField) => {
+    if (blurClearRef.current) { clearTimeout(blurClearRef.current); blurClearRef.current = null }
+    mobileFieldRef.current = field
+    setMobileFocusIndex(index)
+  }
+
+  const handleMobileInputBlur = () => {
+    blurClearRef.current = setTimeout(() => setMobileFocusIndex(null), 200)
+  }
+
+
+  const flashRows = (indices: Set<number>) => {
+    setFlashedRows(indices)
+    setTimeout(() => setFlashedRows(new Set()), 550)
+  }
+
+  const handleApplyFirstToAll = () => {
+    const { volume, price } = hourlyBids[0]
+    setHourlyBids((prev) => prev.map((row, i) => i === 0 ? row : { ...row, volume, price }))
+    flashRows(new Set(hourlyBids.map((_, i) => i).filter((i) => i > 0)))
+  }
+
+  const handleCopyDown = useCallback((fromIndex: number) => {
+    const { volume, price } = hourlyBids[fromIndex]
+    setHourlyBids((prev) => prev.map((r, i) => i > fromIndex ? { ...r, volume, price } : r))
+    flashRows(new Set(Array.from({ length: slotCount - fromIndex - 1 }, (_, k) => fromIndex + 1 + k)))
+  }, [hourlyBids, slotCount])
+
+  const handleApplyToSelected = useCallback(() => {
+    if (selectedRows.size === 0) return
+    const sortedSelected = [...selectedRows].sort((a, b) => a - b)
+    const { volume, price } = hourlyBids[sortedSelected[0]]
+    setHourlyBids((prev) => prev.map((r, i) => selectedRows.has(i) ? { ...r, volume, price } : r))
+    setSelectedRows(new Set())
+    flashRows(new Set(sortedSelected.slice(1)))
+  }, [selectedRows, hourlyBids])
+
+  const handleClearAll = () => {
+    setHourlyBids(createDefaultBids(marketType))
+    setSelectedRows(new Set())
+  }
+
+  // ── Strategy presets ──────────────────────────────────────────────────────
+
+  /** Base Load: fill all slots with reference prices (volume unchanged) */
+  const handlePresetBaseLoad = useCallback(() => {
+    setHourlyBids((prev) =>
+      prev.map((row, i) => ({ ...row, price: parseFloat(refPrices[i].toFixed(2)) }))
+    )
+    flashRows(new Set(Array.from({ length: slotCount }, (_, i) => i)))
+  }, [refPrices, slotCount])
+
+  /** Peak Hours (08–18): fill only peak-hour slots with reference prices */
+  const handlePresetPeakHours = useCallback(() => {
+    const peakSet = new Set(
+      Array.from({ length: slotCount }, (_, i) => i).filter((i) => {
+        const h = isIntraday ? Math.floor(i / 4) : i
+        return h >= 8 && h < 18
+      })
+    )
+    setHourlyBids((prev) =>
+      prev.map((row, i) =>
+        peakSet.has(i) ? { ...row, price: parseFloat(refPrices[i].toFixed(2)) } : row
+      )
+    )
+    flashRows(peakSet)
+  }, [refPrices, slotCount, isIntraday])
+
+  const toggleSection = useCallback((id: SectionId) => {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }, [])
+
+  const toggleRowSelection = useCallback((index: number) => {
+    setSelectedRows((prev) => {
+      const next = new Set(prev)
+      if (next.has(index)) next.delete(index); else next.add(index)
+      return next
+    })
+  }, [])
+
+  // ── Workflow handlers ─────────────────────────────────────────────────────
+
+  const handleStartBidding = useCallback(() => {
+    if (dataSource === "scratch") {
+      setHourlyBids(createDefaultBids(marketType))
+    }
+    // "session" keeps existing bids (already loaded); "csv" placeholder: no-op
+    setCurrentStep(2)
+  }, [dataSource, marketType])
+
+  /** Apply reference prices to selected rows (price only, MW unchanged) */
+  const handleSyncSelectedToRef = useCallback(() => {
+    if (selectedRows.size === 0) return
+    setHourlyBids((prev) =>
+      prev.map((row, i) =>
+        selectedRows.has(i) ? { ...row, price: parseFloat(refPrices[i].toFixed(2)) } : row
+      )
+    )
+    flashRows(new Set(selectedRows))
+    setSelectedRows(new Set())
+  }, [selectedRows, refPrices])
+
+  /** Clear MW and price for selected rows */
+  const handleClearSelected = useCallback(() => {
+    if (selectedRows.size === 0) return
+    setHourlyBids((prev) =>
+      prev.map((row, i) =>
+        selectedRows.has(i) ? { ...row, volume: 0, price: null } : row
+      )
+    )
+    setSelectedRows(new Set())
+  }, [selectedRows])
+
+  // ── Sidebar stepper (desktop) ─────────────────────────────────────────────
+
+  const StepperContentDesktop = (
+    <>
+      <div className="mb-6 flex shrink-0 items-center gap-3 md:mb-8">
+        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
+          <Zap className="h-5 w-5" />
+        </div>
+        <div>
+          <h2 className="text-lg font-bold text-foreground">Green SPOT</h2>
+          <p className="text-xs text-muted-foreground">Auction Portal</p>
+        </div>
+      </div>
+
+      <nav className="flex flex-1 flex-col" aria-label="Progress">
+        {STEPS.map((step, index) => {
+          const isCompleted = step.id < currentStep
+          const isCurrent = step.id === currentStep
+          const isLast = index === STEPS.length - 1
+          return (
+            <div
+              key={step.id}
+              className={cn("flex w-full gap-4", !isLast && "pb-2")}
+              aria-current={isCurrent ? "step" : undefined}
+            >
+              <div className="flex w-8 shrink-0 flex-col items-center">
+                <OtarkStepIndicator stepId={step.id} isCompleted={isCompleted} isCurrent={isCurrent} />
+                {!isLast && <span className="mt-2 block min-h-[2rem] w-px shrink-0 bg-gray-100" aria-hidden />}
+              </div>
+              <div className={cn("min-w-0 flex-1 pt-0.5", !isLast && "pb-6")}>
+                <p className={cn("text-sm font-semibold leading-tight", isCurrent || isCompleted ? "text-foreground" : "text-gray-400")}>
+                  {step.label}
+                </p>
+                <p className="mt-1 text-xs leading-snug text-muted-foreground">{step.description}</p>
+              </div>
+            </div>
+          )
+        })}
+      </nav>
+
+      {/* Summary — only meaningful from step 2 onwards */}
+      {currentStep >= 2 && (
+        <div className="mt-4 shrink-0 rounded-lg border border-gray-200 bg-gray-50/80 p-4 md:mt-auto">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            {marketType === "intraday" ? "Intraday 15m" : "Day-Ahead 1h"}
+          </p>
+          <p className="mt-2 text-xs font-medium text-muted-foreground">Total Volume</p>
+          <p className="text-2xl font-bold text-primary">
+            {totalVolume.toFixed(1)} <span className="text-sm font-normal text-foreground">MWh</span>
+          </p>
+          <p className="mt-0.5 text-xs text-muted-foreground">{filledSlots}/{slotCount} active slots</p>
+          <p className="mt-3 text-xs font-medium text-muted-foreground">Est. max spend</p>
+          <p className="text-lg font-semibold text-foreground">
+            €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </p>
+        </div>
+      )}
+    </>
+  )
+
+  // ── Row render ────────────────────────────────────────────────────────────
+
+  const renderBidRow = useCallback(
+    (index: number, options: { compact: boolean; style?: CSSProperties }) => {
+      const bid = hourlyBids[index]
+      if (!bid) return null
+      const rowState = getRowState(bid)
+      const isActive = rowState === 'active'
+      const isDraft = rowState === 'draft'
+      const ref = refPrices[index] ?? 0
+      // Est. MWh shown for active rows; raw MWh shown for draft rows with volume
+      const estMWh = bid.volume > 0 ? bid.volume * mwhMultiplier : null
+      // Est. Spend: active rows use user price; draft rows use reference price as fallback
+      const estSpend = bid.volume > 0
+        ? bid.volume * mwhMultiplier * (bid.price ?? ref)
+        : null
+      const priceMissing = isDraft && bid.price === null   // volume filled, price empty
+      const volumeMissing = isDraft && bid.volume === 0    // price filled, volume empty
+      const isDeviation = bid.price !== null &&
+        ref > 0 && Math.abs((bid.price - ref) / ref) > 0.2
+      const deviation = bid.price !== null && ref > 0
+        ? ((bid.price - ref) / ref) * 100
+        : null
+      const isSelected = selectedRows.has(index)
+      const { compact, style } = options
+
+      if (compact) {
+        const rowInner = (
+          <div
+            className={cn(
+              "flex w-full min-w-0 border-b border-gray-200 transition-colors",
+              mobileFocusIndex === index && "bg-primary/[0.06] ring-2 ring-primary/30 ring-inset",
+              rowState === 'empty' && mobileFocusIndex !== index && "opacity-60",
+              rowState === 'active' && mobileFocusIndex !== index && "bg-primary/[0.03]",
+              rowState === 'draft' && mobileFocusIndex !== index && "bg-amber-50/40",
+            )}
+          >
+            <div className="sticky left-0 z-[2] flex w-[76px] shrink-0 flex-col justify-center gap-1 border-r border-gray-200 bg-white px-2 py-2 pl-3 shadow-[4px_0_12px_-4px_rgba(0,0,0,0.08)]">
+              <OtarkCheckbox
+                checked={isSelected}
+                onChange={() => toggleRowSelection(index)}
+                ariaLabel={`Select ${bid.hour}`}
+              />
+              <span className="text-[11px] font-semibold leading-tight text-foreground">{bid.hour}</span>
+              {rowState === 'active' && (
+                <span className="flex h-5 w-5 items-center justify-center rounded border border-emerald-200 bg-emerald-50">
+                  <Leaf className="h-3 w-3 text-emerald-600" aria-hidden />
+                </span>
+              )}
+              {rowState === 'draft' && (
+                <span className="flex h-5 w-5 items-center justify-center rounded border border-amber-200 bg-amber-50">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                </span>
+              )}
+            </div>
+            <div className="min-w-0 flex-1 overflow-x-auto px-2 py-2">
+              <div className="grid min-w-[260px] grid-cols-2 gap-2">
+                <div className="relative">
+                  <span className="mb-0.5 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground">MW</span>
+                  <input
+                    type="number"
+                    data-bid-input={`volume-${index}`}
+                    placeholder="—"
+                    value={bid.volume === 0 ? "" : bid.volume}
+                    onChange={(e) => handleVolumeChange(index, e.target.value)}
+                    onKeyDown={(e) => handleBidKeyDown(e, index, "volume")}
+                    onFocus={() => handleMobileInputFocus(index, "volume")}
+                    onBlur={handleMobileInputBlur}
+                    className={cn(
+                      "w-full rounded-lg border bg-white px-2 py-2 text-right text-sm font-medium shadow-sm focus:outline-none focus:ring-2",
+                      volumeMissing
+                        ? "border-red-300 ring-1 ring-red-300/50 focus:border-red-400 focus:ring-red-300/40"
+                        : "border-gray-200 focus:border-primary focus:ring-primary/20"
+                    )}
+                    min={0}
+                    step={0.1}
+                  />
+                </div>
+                <div className="relative">
+                  <span className="mb-0.5 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground">€/MWh</span>
+                  <input
+                    type="number"
+                    data-bid-input={`price-${index}`}
+                    placeholder="—"
+                    value={bid.price === null ? "" : bid.price}
+                    onChange={(e) => handlePriceChange(index, e.target.value)}
+                    onKeyDown={(e) => handleBidKeyDown(e, index, "price")}
+                    onFocus={() => handleMobileInputFocus(index, "price")}
+                    onBlur={handleMobileInputBlur}
+                    className={cn(
+                      "w-full rounded-lg border bg-white px-2 py-2 text-right text-sm font-medium shadow-sm focus:outline-none focus:ring-2",
+                      isDeviation
+                        ? "border-amber-400 focus:border-amber-400 focus:ring-amber-400/25"
+                        : priceMissing
+                          ? "border-red-300 ring-1 ring-red-300/50 focus:border-red-400 focus:ring-red-300/40"
+                          : "border-gray-200 focus:border-primary focus:ring-primary/20"
+                    )}
+                    step={0.01}
+                  />
+                </div>
+              </div>
+              {isDraft ? (
+                <p className="mt-1 text-center text-[10px] text-amber-500/80">
+                  Complete both fields to activate
+                </p>
+              ) : (
+                <p className="mt-1 text-center text-[11px] text-muted-foreground">
+                  {estMWh != null ? (
+                    <>
+                      Est.{" "}
+                      <span className="font-semibold text-primary">
+                        {estMWh.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} MWh
+                      </span>
+                      {estSpend != null && (
+                        <span className="ml-2">
+                          · €{estSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-muted-foreground/40">—</span>
+                  )}
+                </p>
+              )}
+            </div>
+          </div>
+        )
+        return (
+          <div style={style} className="w-full">{rowInner}</div>
+        )
+      }
+
+      // Desktop row — 7-column grid (On/Off removed; state is derived)
+      // [sel 26px] [time 150px] [mw 1fr] [est 80px] [ref 72px] [price 1fr] [copy 26px]
+      return (
+        <div
+          style={style}
+          className={cn(
+            "grid grid-cols-[26px_150px_1fr_80px_72px_1fr_26px] items-center gap-2 px-2 py-2 transition-colors duration-300 sm:grid-cols-[26px_170px_1fr_86px_76px_1fr_26px] sm:px-4",
+            flashedRows.has(index)
+              ? "bg-primary/[0.08]"
+              : isSelected
+                ? "bg-sky-50 ring-1 ring-inset ring-sky-200"
+                : rowState === 'active'
+                  ? "bg-primary/[0.03]"
+                  : rowState === 'draft'
+                    ? "bg-amber-50/30"
+                    : "bg-white hover:bg-gray-50/50"
+          )}
+        >
+          {/* Select */}
+          <div className="flex justify-center">
+            <OtarkCheckbox
+              checked={isSelected}
+              onChange={() => toggleRowSelection(index)}
+              ariaLabel={`Select row ${bid.hour}`}
+            />
+          </div>
+
+          {/* Time + state dot */}
+          <div className="flex min-w-0 items-center gap-2">
+            <div className={cn(
+              "h-2 w-2 shrink-0 rounded-full",
+              rowState === 'active' ? "bg-emerald-400" :
+              rowState === 'draft' ? "bg-amber-400/70" :
+              "bg-muted-foreground/20"
+            )} />
+            <span className="truncate text-xs font-medium text-foreground sm:text-sm">{bid.hour}</span>
+          </div>
+
+          {/* MW */}
+          <div className={cn(
+            "flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition-colors focus-within:ring-2",
+            volumeMissing
+              ? "border-red-300 ring-1 ring-red-300/50 focus-within:border-red-400 focus-within:ring-red-300/40"
+              : "border-gray-200 focus-within:border-primary focus-within:ring-primary/20"
+          )}>
+            <input
+              type="number"
+              data-bid-input={`volume-${index}`}
+              placeholder="0.0"
+              value={bid.volume === 0 ? "" : bid.volume}
+              onChange={(e) => handleVolumeChange(index, e.target.value)}
+              onKeyDown={(e) => handleBidKeyDown(e, index, "volume")}
+              className="min-w-0 flex-1 bg-transparent py-1.5 pl-2 pr-0.5 text-right text-sm font-medium text-foreground focus:outline-none sm:py-2"
+              min={0}
+              step={0.1}
+            />
+            <span className="shrink-0 select-none pr-2 text-[10px] text-muted-foreground">MW</span>
+          </div>
+
+          {/* Est. MWh + helper */}
+          <div className="flex flex-col items-end gap-0.5 pr-1 text-right">
+            {isActive ? (
+              <>
+                <span className="tabular-nums text-xs font-medium text-sky-600/80 sm:text-sm">
+                  {(bid.volume * mwhMultiplier).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                <span className="tabular-nums text-[10px] text-muted-foreground">
+                  €{estSpend!.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </>
+            ) : isDraft ? (
+              <>
+                {bid.volume > 0 && (
+                  <span className="tabular-nums text-xs text-muted-foreground/60 sm:text-sm">
+                    {(bid.volume * mwhMultiplier).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </span>
+                )}
+                <span className="text-[10px] leading-tight text-amber-500/80">
+                  {priceMissing ? "add price" : "add MW"}
+                </span>
+              </>
+            ) : (
+              <span className="text-xs text-muted-foreground/25">—</span>
+            )}
+          </div>
+
+          {/* Ref (€) + % deviation */}
+          <div className="pr-1 text-right">
+            <span className="tabular-nums text-xs text-muted-foreground sm:text-sm">
+              {ref.toFixed(2)}
+            </span>
+            {deviation !== null && (
+              <span className={cn(
+                "block tabular-nums text-[10px] leading-none",
+                Math.abs(deviation) > 20 ? "text-amber-500" :
+                deviation < -5 ? "text-emerald-500/80" :
+                deviation > 5 ? "text-orange-400/80" :
+                "text-muted-foreground/50"
+              )}>
+                {deviation > 0 ? "+" : ""}{deviation.toFixed(0)}%
+              </span>
+            )}
+          </div>
+
+          {/* €/MWh with deviation tooltip */}
+          <div className="relative min-w-0">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className={cn(
+                  "flex items-center rounded-lg border bg-white shadow-sm transition-colors focus-within:ring-2",
+                  isDeviation
+                    ? "border-amber-400 focus-within:border-amber-400 focus-within:ring-amber-400/25"
+                    : priceMissing
+                      ? "border-red-300 ring-1 ring-red-300/50 focus-within:border-red-400 focus-within:ring-red-300/40"
+                      : "border-gray-200 focus-within:border-primary focus-within:ring-primary/20"
+                )}>
+                  <input
+                    type="number"
+                    data-bid-input={`price-${index}`}
+                    placeholder="0.00"
+                    value={bid.price === null ? "" : bid.price}
+                    onChange={(e) => handlePriceChange(index, e.target.value)}
+                    onKeyDown={(e) => handleBidKeyDown(e, index, "price")}
+                    className="min-w-0 flex-1 bg-transparent py-1.5 pl-2 pr-0.5 text-right text-sm font-medium text-foreground focus:outline-none sm:py-2"
+                    step={0.01}
+                  />
+                  <span className="shrink-0 select-none pr-2 text-[10px] text-muted-foreground">€/MWh</span>
+                </div>
+              </TooltipTrigger>
+              {isDeviation && (
+                <TooltipContent side="top">
+                  Price deviates {Math.abs(deviation!).toFixed(0)}% from market reference
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </div>
+
+          {/* Copy Values Down */}
+          <div className="flex justify-center">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={() => handleCopyDown(index)}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground/40 transition-colors hover:bg-gray-100 hover:text-muted-foreground"
+                  aria-label={`Copy values from ${bid.hour} down`}
+                  disabled={index >= slotCount - 1}
+                >
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="left">Copy values down</TooltipContent>
+            </Tooltip>
+          </div>
+        </div>
+      )
+    },
+    [
+      hourlyBids, refPrices, mwhMultiplier, mobileFocusIndex, flashedRows, selectedRows,
+      updateBidRow, handleVolumeChange, handlePriceChange, handleBidKeyDown,
+      handleMobileInputFocus, handleMobileInputBlur, toggleRowSelection, handleCopyDown, slotCount,
+    ]
+  )
+
+  const MobileVirtualRow = useCallback(
+    ({ index, style, ariaAttributes }: {
+      index: number
+      style: CSSProperties
+      ariaAttributes: { "aria-posinset": number; "aria-setsize": number; role: "listitem" }
+    }) => (
+      <div style={style} {...ariaAttributes}>
+        {renderBidRow(index, { compact: true })}
+      </div>
+    ),
+    [renderBidRow]
+  )
+
+  // ── Desktop table section rendering ───────────────────────────────────────
+
+  const TABLE_HEADER_COLS = "grid-cols-[26px_150px_1fr_80px_72px_1fr_26px] sm:grid-cols-[26px_170px_1fr_86px_76px_1fr_26px]"
+
+  const renderDesktopTable = () => (
+    <div className="divide-y divide-gray-200 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
+      {/* Glassmorphism sticky header */}
+      <div className={cn(
+        "sticky top-0 z-10 grid items-center gap-2 px-2 py-2.5 sm:px-4",
+        TABLE_HEADER_COLS,
+        "backdrop-blur-md bg-white/75 border-b border-white/20 shadow-[0_1px_8px_rgba(0,33,71,0.08)]",
+        "text-[10px] font-semibold uppercase tracking-wide text-muted-foreground sm:text-xs"
+      )}>
+        <span className="text-center">Sel</span>
+        <span className="flex items-center gap-1.5">
+          Time
+          <span className="inline-flex items-center gap-1 rounded border border-gray-200 bg-white/80 px-1.5 py-0.5 text-[9px] font-medium normal-case tracking-normal text-foreground shadow-sm">
+            <Leaf className="h-2.5 w-2.5 text-emerald-600" aria-hidden />
+            HKN
+          </span>
+        </span>
+        <span className="text-right">MW</span>
+        <span className="text-right">
+          Est. MWh
+          <span className="block text-[8px] font-normal normal-case tracking-normal opacity-60">& Spend</span>
+        </span>
+        <span className="text-right">
+          Ref (€)
+          <span className="block text-[8px] font-normal normal-case tracking-normal opacity-60">% diff</span>
+        </span>
+        <span className="text-right">€/MWh</span>
+        <span />
+      </div>
+
+      {/* Sections */}
+      {SECTIONS.map((sec) => {
+        const [start, end] = getSectionSlotRange(sec, isIntraday)
+        const sectionBids = hourlyBids.slice(start, end + 1)
+        const activeSectionCount = sectionBids.filter((b) => b.volume > 0 && b.price !== null).length
+        const collapsed = collapsedSections.has(sec.id)
+        // Warn on the tab only when collapsed so incomplete rows are hidden from view
+        const hasHiddenDraft = collapsed && sectionBids.some((b) => getRowState(b) === "draft")
+        const SectionIcon = sec.icon
+
+        return (
+          <div key={sec.id}>
+            {/* Section header */}
+            <button
+              type="button"
+              onClick={() => toggleSection(sec.id)}
+              className={cn(
+                "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors sm:px-4",
+                hasHiddenDraft
+                  ? "bg-amber-50/70 hover:bg-amber-50"
+                  : "bg-gray-50/80 hover:bg-gray-100/80"
+              )}
+            >
+              <ChevronDown
+                className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform duration-200", collapsed && "-rotate-90")}
+              />
+              <SectionIcon className={cn("h-3.5 w-3.5 shrink-0", hasHiddenDraft ? "text-amber-500/70" : "text-muted-foreground/70")} />
+              <span className="text-xs font-semibold text-foreground">{sec.label}</span>
+              <span className="text-[10px] text-muted-foreground">{sec.timeRange}</span>
+              {hasHiddenDraft && (
+                <span className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                  incomplete
+                </span>
+              )}
+              <span className="ml-auto text-[10px] font-medium text-muted-foreground">
+                {activeSectionCount}/{sectionBids.length} active
+              </span>
+            </button>
+
+            {/* Section rows */}
+            {!collapsed && (
+              <div className="divide-y divide-gray-100">
+                {sectionBids.map((_, relIdx) => {
+                  const absIdx = start + relIdx
+                  return (
+                    <div key={hourlyBids[absIdx]?.hour ?? absIdx}>
+                      {renderBidRow(absIdx, { compact: false })}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+
+  // ── Step 1: Setup ─────────────────────────────────────────────────────────
+
+  const renderStep1 = () => (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      {/* Desktop header */}
+      <div className="hidden items-center justify-between border-b border-gray-200 bg-white px-6 py-4 sm:px-8 sm:py-5 md:flex">
+        <div>
+          <h1 className="text-lg font-bold text-foreground sm:text-xl">Auction Setup</h1>
+          <p className="text-xs text-muted-foreground sm:text-sm">Select market type and session data source</p>
+        </div>
+        <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
+          <X className="h-5 w-5" />
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-auto px-5 py-6 sm:px-8 sm:py-8">
+        <div className="mx-auto max-w-lg space-y-7">
+
+          {/* Market Type */}
+          <div>
+            <p className="text-sm font-semibold text-foreground">Market Type</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">Determines slot granularity for this session</p>
+            <div className="mt-3 inline-flex rounded-xl border border-gray-200 bg-gray-50 p-1 shadow-sm">
+              <button
+                type="button"
+                onClick={() => handleMarketTypeChange("day-ahead")}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all",
+                  marketType === "day-ahead"
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+              >
+                <Sun className="h-4 w-4" />
+                Day-Ahead
+                <span className={cn("text-[10px]", marketType === "day-ahead" ? "text-primary-foreground/70" : "text-muted-foreground/60")}>
+                  24h slots
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleMarketTypeChange("intraday")}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all",
+                  marketType === "intraday"
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+              >
+                <Clock className="h-4 w-4" />
+                Intraday
+                <span className={cn("text-[10px]", marketType === "intraday" ? "text-primary-foreground/70" : "text-muted-foreground/60")}>
+                  96 × 15m
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {/* Gate Closure */}
+          <div className={cn(
+            "flex items-start gap-3 rounded-xl border p-4",
+            nearClosure
+              ? "border-[#ffdc45]/50 bg-[#ffdc45]/8"
+              : "border-gray-200 bg-gray-50"
+          )}>
+            <Clock className={cn("mt-0.5 h-4 w-4 shrink-0", nearClosure ? "text-amber-600" : "text-muted-foreground")} />
+            <div>
+              <p className={cn("text-sm font-medium", nearClosure ? "text-amber-800" : "text-foreground")}>
+                Auction closes at 11:00 CET
+              </p>
+              <p className={cn("mt-0.5 text-xs", nearClosure ? "text-amber-700" : "text-muted-foreground")}>
+                {nearClosure
+                  ? "Gate closing soon — submit your bid before the deadline"
+                  : "Day-Ahead gate closure · submit before 11:00"}
+              </p>
+            </div>
+          </div>
+
+          {/* Data Source */}
+          <div>
+            <p className="text-sm font-semibold text-foreground">Session Data</p>
+            <p className="mt-0.5 mb-3 text-xs text-muted-foreground">Choose how to populate bid slots for this session</p>
+            <div className="space-y-2">
+              {(["session", "scratch", "csv"] as const).map((src) => {
+                const meta: Record<DataSource, { title: string; desc: string }> = {
+                  session: { title: "Use Last Session Values", desc: "Restore bids from your previous session" },
+                  scratch: { title: "Start from Scratch", desc: "Begin with empty bid slots" },
+                  csv:     { title: "Upload CSV", desc: "Import bid values from a spreadsheet" },
+                }
+                const selected = dataSource === src
+                return (
+                  <label
+                    key={src}
+                    className={cn(
+                      "flex cursor-pointer items-start gap-3 rounded-xl border p-4 transition-colors",
+                      selected ? "border-primary/30 bg-primary/[0.04]" : "border-gray-200 hover:bg-gray-50"
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="dataSource"
+                      value={src}
+                      checked={selected}
+                      onChange={() => setDataSource(src)}
+                      className="sr-only"
+                    />
+                    <div className={cn(
+                      "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 transition-colors",
+                      selected ? "border-primary" : "border-gray-300"
+                    )}>
+                      {selected && <div className="h-2 w-2 rounded-full bg-primary" />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-foreground">{meta[src].title}</span>
+                        {src === "csv" && (
+                          <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                            UI only
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-0.5 text-xs text-muted-foreground">{meta[src].desc}</p>
+
+                      {/* CSV drop zone — placeholder only */}
+                      {src === "csv" && selected && (
+                        <div className="mt-3 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 px-4 py-8 text-center">
+                          <Upload className="h-7 w-7 text-muted-foreground/30" />
+                          <div>
+                            <p className="text-xs font-medium text-muted-foreground">Drag & drop a .csv file</p>
+                            <p className="mt-0.5 text-[10px] text-muted-foreground/60">or click to browse · not yet implemented</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </label>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="shrink-0 border-t border-gray-200 bg-white px-5 py-4 sm:flex sm:items-center sm:justify-end sm:px-8">
+        <button
+          type="button"
+          onClick={handleStartBidding}
+          className="w-full rounded-xl bg-primary px-8 py-3 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 sm:w-auto"
+        >
+          Start Bidding →
+        </button>
+      </div>
+    </div>
+  )
+
+  // ── Step 3: Review ────────────────────────────────────────────────────────
+
+  const renderStep3 = () => {
+    const activeRows = hourlyBids
+      .map((bid, i) => ({ bid, i }))
+      .filter(({ bid }) => bid.volume > 0 && bid.price !== null)
+
+    if (submitted) {
+      return (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 p-8 text-center">
+          <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
+            <Check className="h-8 w-8 text-emerald-600" strokeWidth={2.5} />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-foreground">Bid Submitted</h2>
+            <p className="mt-1 text-sm text-muted-foreground">Your bid has been sent to the exchange</p>
+          </div>
+          <div className="rounded-xl border border-primary/20 bg-primary/5 px-8 py-5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Total Volume</p>
+            <p className="mt-1 text-2xl font-bold text-primary">{totalVolume.toFixed(2)} MWh</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Est. max spend · €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => { setSubmitted(false); setCurrentStep(1); setHourlyBids(createDefaultBids(marketType)) }}
+            className="mt-1 text-sm font-medium text-primary hover:underline"
+          >
+            Start new session
+          </button>
+        </div>
+      )
+    }
+
+    return (
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Desktop header */}
+        <div className="hidden items-center justify-between border-b border-gray-200 bg-white px-6 py-4 sm:px-8 sm:py-5 md:flex">
+          <div>
+            <h1 className="text-lg font-bold text-foreground sm:text-xl">Review Bid</h1>
+            <p className="text-xs text-muted-foreground sm:text-sm">
+              {activeRows.length} active {activeRows.length === 1 ? "slot" : "slots"} · {totalVolume.toFixed(2)} MWh
+            </p>
+          </div>
+          <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-auto p-5 sm:p-8">
+          {activeRows.length === 0 ? (
+            <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
+              <AlertCircle className="h-8 w-8 text-muted-foreground/30" />
+              <p className="text-sm font-medium text-foreground">No active bids</p>
+              <p className="text-xs text-muted-foreground">Go back and fill MW + Price on at least one slot</p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {/* Compact bid table */}
+              <div className="overflow-hidden rounded-xl border border-gray-200">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-gray-50 text-left">
+                      <th className="px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Hour</th>
+                      <th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">MW</th>
+                      <th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">€/MWh</th>
+                      <th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Total (€)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {activeRows.map(({ bid }) => {
+                      const mwh = bid.volume * mwhMultiplier
+                      const total = mwh * bid.price!
+                      return (
+                        <tr key={bid.hour} className="bg-white hover:bg-gray-50/50">
+                          <td className="px-4 py-2 font-mono text-xs text-foreground">{bid.hour}</td>
+                          <td className="px-4 py-2 text-right tabular-nums text-sm">{bid.volume.toFixed(1)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums text-sm">{bid.price!.toFixed(2)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums text-sm font-medium text-foreground">
+                            {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Exposure summary card */}
+              <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-5">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-primary/60">Exposure Summary</p>
+                <div className="mt-4 grid grid-cols-2 gap-6">
+                  <div>
+                    <p className="text-[10px] text-muted-foreground">Total Volume</p>
+                    <p className="mt-0.5 text-2xl font-bold text-primary">
+                      {totalVolume.toFixed(2)}{" "}
+                      <span className="text-sm font-normal text-foreground">MWh</span>
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-muted-foreground">Est. Max Spend</p>
+                    <p className="mt-0.5 text-2xl font-bold text-primary">
+                      €{estimatedMaxSpend.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-4 flex items-center gap-2 border-t border-primary/10 pt-3 text-[10px] text-muted-foreground">
+                  <span>{activeRows.length} active {activeRows.length === 1 ? "slot" : "slots"}</span>
+                  <span>·</span>
+                  <span>{marketType === "intraday" ? "Intraday 15m" : "Day-Ahead 1h"}</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Desktop footer */}
+        <div className="hidden shrink-0 items-center justify-between border-t border-gray-200 bg-white px-6 py-4 sm:px-8 sm:py-5 md:flex">
+          <button
+            type="button"
+            onClick={() => setCurrentStep(2)}
+            className="rounded-lg px-4 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground sm:px-6"
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            onClick={() => setSubmitted(true)}
+            disabled={activeRows.length === 0}
+            className="rounded-xl bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Submit Bid to Exchange
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Main render ───────────────────────────────────────────────────────────
+
+  if (!isOpen) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background p-4">
+        <button
+          type="button"
+          onClick={() => setIsOpen(true)}
+          className="rounded-lg bg-primary px-8 py-4 text-lg font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90"
+        >
+          Open Green SPOT Auction
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900/35 p-0 backdrop-blur-[2px] sm:p-4">
+      <div className="flex h-[100dvh] max-h-[900px] w-full max-w-6xl flex-col overflow-hidden rounded-none border-0 border-gray-200 bg-white shadow-2xl sm:rounded-2xl sm:border md:h-[90vh] md:flex-row md:rounded-2xl">
+
+        {/* Desktop sidebar — always visible */}
+        <div className="hidden min-h-0 w-[35%] min-w-[280px] max-w-[380px] shrink-0 flex-col border-r border-gray-200 bg-white p-8 md:flex">
+          {StepperContentDesktop}
+        </div>
+
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] md:pb-0">
+
+          {/* Mobile horizontal stepper */}
+          <div className="flex shrink-0 items-center gap-2 border-b border-gray-200 bg-white px-3 py-2.5 md:hidden">
+            <button
+              type="button"
+              onClick={() => currentStep > 1 && setCurrentStep(currentStep - 1)}
+              disabled={currentStep === 1}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-foreground disabled:opacity-30 hover:bg-gray-100"
+              aria-label="Back"
+            >
+              <ChevronLeft className="h-5 w-5" />
+            </button>
+
+            {/* Step pills */}
+            <div className="flex flex-1 items-center justify-center gap-1" aria-label="Progress">
+              {STEPS.map((step, idx) => (
+                <div key={step.id} className="flex items-center gap-1">
+                  <div className={cn(
+                    "h-1.5 rounded-full transition-all duration-300",
+                    currentStep === step.id ? "w-8 bg-primary" :
+                    currentStep > step.id ? "w-5 bg-primary/40" :
+                    "w-5 bg-gray-200"
+                  )} />
+                  {idx < STEPS.length - 1 && <div className="h-px w-1.5 bg-gray-200" />}
+                </div>
+              ))}
+            </div>
+
+            <div className="shrink-0 text-center">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                {currentStep} / 3
+              </p>
+              <p className="text-xs font-bold text-foreground">{STEPS[currentStep - 1].label}</p>
+            </div>
+
+            {/* Step 2 quick actions */}
+            {currentStep === 2 && (
+              <>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button type="button" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="More actions">
+                      <MoreHorizontal className="h-5 w-5" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48">
+                    <DropdownMenuItem onClick={handlePresetBaseLoad}>
+                      Sync All Prices
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={handlePresetPeakHours}>
+                      Sync Peak Prices
+                    </DropdownMenuItem>
+                    <DropdownMenuItem className="text-red-600 focus:text-red-600" onClick={handleClearAll}>
+                      Clear All
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            )}
+
+            <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+
+          {/* ── Step 1 ──────────────────────────────────────────────────── */}
+          {currentStep === 1 && renderStep1()}
+
+          {/* ── Step 2: Bid Entry ───────────────────────────────────────── */}
+          {currentStep === 2 && (
+            <>
+              {/* Desktop header */}
+              <div className="hidden items-center justify-between border-b border-gray-200 bg-white px-6 py-3.5 sm:px-8 md:flex">
+                <div className="flex items-center gap-3">
+                  <h1 className="text-base font-bold text-foreground sm:text-lg">Bid Entry</h1>
+                  {/* Read-only market type indicator — change only in Step 1 */}
+                  <span className="flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs font-medium text-muted-foreground">
+                    {isIntraday ? <Clock className="h-3.5 w-3.5" /> : <Sun className="h-3.5 w-3.5" />}
+                    {isIntraday ? "Intraday · 96 × 15m" : "Day-Ahead · 24h"}
+                  </span>
+                </div>
+                <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              {/* Desktop control bar */}
+              <div className="hidden shrink-0 border-b border-gray-200 bg-gray-50/60 px-6 py-3 md:block sm:px-8">
+                <div className="flex flex-wrap items-center gap-3">
+                  {/* Price presets */}
+                  <div className="flex items-center gap-1.5 border-r border-gray-200 pr-3">
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">Price sync</span>
+                    <button
+                      type="button"
+                      onClick={handlePresetBaseLoad}
+                      className="flex items-center gap-1.5 rounded-md bg-primary/5 px-2.5 py-1.5 text-xs font-medium text-primary/80 ring-1 ring-primary/15 transition-colors hover:bg-primary/10"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      Sync All Prices
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handlePresetPeakHours}
+                      className="flex items-center gap-1.5 rounded-md bg-primary/5 px-2.5 py-1.5 text-xs font-medium text-primary/80 ring-1 ring-primary/15 transition-colors hover:bg-primary/10"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      Sync Peak (08–18)
+                    </button>
+                  </div>
+
+                  <div className="ml-auto flex items-center gap-1">
+                    <button type="button" onClick={handleApplyFirstToAll} className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+                      Apply First to All
+                    </button>
+                    <button type="button" onClick={handleClearAll} className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Floating selection action bar — desktop */}
+              {selectedRows.size > 0 && (
+                <div className="hidden shrink-0 items-center gap-3 border-b border-primary/10 bg-primary/[0.04] px-6 py-2 sm:px-8 md:flex">
+                  <span className="text-xs font-medium text-primary/70">
+                    {selectedRows.size} row{selectedRows.size > 1 ? "s" : ""} selected
+                  </span>
+                  <div className="h-3.5 w-px bg-primary/20" />
+                  <button type="button" onClick={handleSyncSelectedToRef} className="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-primary/80 ring-1 ring-primary/20 transition-colors hover:bg-primary/10">
+                    <RefreshCw className="h-3 w-3" />
+                    Sync to REF
+                  </button>
+                  <button type="button" onClick={handleClearSelected} className="rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground ring-1 ring-gray-200 transition-colors hover:bg-gray-100">
+                    Clear Selected
+                  </button>
+                  <button type="button" onClick={() => setSelectedRows(new Set())} className="ml-auto flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-muted-foreground">
+                    <X className="h-3 w-3" /> Deselect
+                  </button>
+                </div>
+              )}
+
+              {/* Mobile hour stepper */}
+              <AnimatePresence>
+                {isMobile && mobileFocusIndex !== null && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="sticky top-0 z-30 flex shrink-0 items-center justify-between gap-2 overflow-hidden border-b border-primary/20 bg-primary/5 px-3 py-2 md:hidden"
+                  >
+                    <button
+                      type="button"
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white text-primary shadow-sm ring-1 ring-gray-200"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => focusHourAtField(mobileFocusIndex - 1, mobileFieldRef.current)}
+                      disabled={mobileFocusIndex <= 0}
+                      aria-label="Previous hour"
+                    >
+                      <ChevronLeft className="h-5 w-5" />
+                    </button>
+                    <span className="text-center text-xs font-semibold text-foreground">
+                      {hourlyBids[mobileFocusIndex]?.hour ?? ""}
+                      <span className="block text-[10px] font-normal text-muted-foreground">{mobileFocusIndex + 1} / {slotCount}</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white text-primary shadow-sm ring-1 ring-gray-200"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => focusHourAtField(mobileFocusIndex + 1, mobileFieldRef.current)}
+                      disabled={mobileFocusIndex >= slotCount - 1}
+                      aria-label="Next hour"
+                    >
+                      <ChevronRight className="h-5 w-5" />
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Bid list */}
+              <div ref={listWrapRef} className="min-h-0 flex-1 overflow-hidden px-0 pb-28 pt-0 md:overflow-auto md:p-6 md:px-8 md:pb-4">
+                <AnimatePresence mode="wait">
+                  <motion.div
+                    key={marketType}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -4 }}
+                    transition={{ duration: 0.22, ease: "easeOut" }}
+                    className="flex h-full min-h-0 flex-col md:h-auto"
+                  >
+                    {isMobile ? (
+                      <VirtualList
+                        key={`${marketType}-${slotCount}`}
+                        rowCount={slotCount}
+                        rowHeight={MOBILE_ROW_H}
+                        rowComponent={MobileVirtualRow}
+                        rowProps={{}}
+                        overscanCount={6}
+                        defaultHeight={listHeight}
+                        style={{ height: listHeight, width: "100%" }}
+                      />
+                    ) : (
+                      renderDesktopTable()
+                    )}
+                  </motion.div>
+                </AnimatePresence>
+              </div>
+
+              {/* Desktop footer — Step 2 */}
+              {/*
+                Below lg  : stats row → warning row → buttons row (each full-width)
+                lg+       : single row, stats left · warning+buttons right
+              */}
+              <div className="hidden shrink-0 flex-col gap-2.5 border-t border-gray-200 bg-white px-6 py-3.5 sm:px-8 md:flex lg:flex-row lg:items-center lg:justify-between lg:gap-3 lg:py-4">
+
+                {/* Stats — always one horizontal row */}
+                <div className="flex items-center gap-2">
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
+                    <p className="text-[10px] text-muted-foreground">Total Volume</p>
+                    <p className="text-sm font-bold text-foreground lg:text-base">{totalVolume.toFixed(2)} MWh</p>
+                  </div>
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
+                    <p className="text-[10px] text-muted-foreground">Est. max spend</p>
+                    <p className="text-sm font-bold text-foreground lg:text-base">
+                      €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
+                    <p className="text-[10px] text-muted-foreground">Active slots</p>
+                    <p className="text-sm font-bold text-foreground lg:text-base">{filledSlots} / {slotCount}</p>
+                  </div>
+                  <span className={cn("ml-1 text-[10px] font-medium transition-opacity duration-500", draftSaved ? "text-emerald-600 opacity-100" : "opacity-0")} aria-live="polite">
+                    ✓ Draft saved
+                  </span>
+                </div>
+
+                {/* Warning text — own row below lg, inline at lg+ */}
+                {(!canContinue || draftCount > 0) && (
+                  <div className="flex items-center gap-1 lg:hidden">
+                    {!canContinue ? (
+                      <>
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                        <span className="text-xs text-muted-foreground">Fill MW + Price on at least one slot</span>
+                      </>
+                    ) : (
+                      <span className="text-xs text-amber-600/80">
+                        {draftCount} incomplete {draftCount === 1 ? "row" : "rows"} will be skipped
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {/* Buttons + inline warning at lg+ */}
+                <div className="flex items-center justify-between gap-3 lg:justify-end">
+                  {/* Warning visible only lg+ */}
+                  <div className="hidden lg:flex lg:items-center lg:gap-1">
+                    {!canContinue && (
+                      <>
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                        <span className="text-xs text-muted-foreground">Fill MW + Price on at least one slot</span>
+                      </>
+                    )}
+                    {canContinue && draftCount > 0 && (
+                      <span className="text-xs text-amber-600/80">
+                        {draftCount} incomplete {draftCount === 1 ? "row" : "rows"} will be skipped
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setCurrentStep(1)} className="rounded-lg px-4 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground lg:px-6">
+                      Back
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCurrentStep(3)}
+                      disabled={!canContinue}
+                      className="rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 lg:px-6"
+                    >
+                      Review Bid
+                    </button>
+                  </div>
+                </div>
+
+              </div>
+            </>
+          )}
+
+          {/* ── Step 3 ──────────────────────────────────────────────────── */}
+          {currentStep === 3 && renderStep3()}
+
+        </div>
+      </div>
+
+      {/* Mobile FAB — Step 2 only */}
+      {currentStep === 2 && (
+        <button
+          type="button"
+          onClick={handleApplyFirstToAll}
+          className="fixed bottom-[calc(5.5rem+env(safe-area-inset-bottom))] right-4 z-40 flex h-12 w-12 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg ring-2 ring-white/90 transition hover:opacity-95 md:hidden"
+          aria-label="Apply first row to all slots"
+        >
+          <Copy className="h-5 w-5" />
+        </button>
+      )}
+
+      {/* Mobile bottom bar — Step 1 */}
+      {currentStep === 1 && (
+        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-gray-200 bg-white/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-4px_24px_rgba(0,0,0,0.08)] backdrop-blur-sm md:hidden">
+          <button
+            type="button"
+            onClick={handleStartBidding}
+            className="w-full rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow-sm"
+          >
+            Start Bidding →
+          </button>
+        </div>
+      )}
+
+      {/* Mobile bottom bar — Step 2 */}
+      {currentStep === 2 && (
+        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-gray-200 bg-white/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-4px_24px_rgba(0,0,0,0.08)] backdrop-blur-sm md:hidden">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Total volume</p>
+              <p className="text-lg font-bold text-primary">
+                {totalVolume.toFixed(1)} <span className="text-sm font-semibold text-foreground">MWh</span>
+              </p>
+              {!canContinue && (
+                <p className="text-[10px] text-amber-600">Add MW + Price to continue</p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setCurrentStep(3)}
+              disabled={!canContinue}
+              className="min-w-[130px] rounded-xl bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Review Bid
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Mobile bottom bar — Step 3 */}
+      {currentStep === 3 && !submitted && (
+        <div className="fixed inset-x-0 bottom-0 z-40 flex items-center justify-between gap-3 border-t border-gray-200 bg-white/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-4px_24px_rgba(0,0,0,0.08)] backdrop-blur-sm md:hidden">
+          <button type="button" onClick={() => setCurrentStep(2)} className="rounded-xl px-5 py-3 text-sm font-semibold text-muted-foreground hover:bg-accent">
+            Back
+          </button>
+          <button
+            type="button"
+            onClick={() => setSubmitted(true)}
+            className="flex-1 rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow-sm"
+          >
+            Submit to Exchange
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
