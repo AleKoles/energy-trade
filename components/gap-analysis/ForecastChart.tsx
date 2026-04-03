@@ -9,166 +9,131 @@ import {
   XAxis,
   YAxis,
   CartesianGrid,
+  ReferenceLine,
+  Label,
   type TooltipProps,
 } from "recharts"
 import type { GapDataPoint } from "./useGapData"
+import { cn } from "@/lib/utils"
 
-// ─── Palette (trading-terminal dark) ─────────────────────────────────────────
-
-const C = {
-  bg:           "#0f172a",   // slate-900
-  grid:         "rgba(255,255,255,0.06)",
-  axis:         "rgba(255,255,255,0.35)",
-  supply:       "#34d399",   // emerald-400
-  supplyFill:   "rgba(52,211,153,0.55)",
-  load:         "#60a5fa",   // blue-400
-  shortage:     "#f87171",   // red-400
-  shortageFill: "rgba(248,113,113,0.38)",
-  tooltipBg:    "#1e293b",   // slate-800
-  tooltipBorder:"rgba(255,255,255,0.10)",
+const COLORS = {
+  wind: "#38bdf8",
+  solar: "#fbbf24",
+  load: "#60a5fa",
+  shortage: "#f87171",
+  grid: "#f1f5f9",
+  axis: "#94a3b8",
+  priceLine: "#94a3b8",
 } as const
 
-// ─── Custom tooltip ───────────────────────────────────────────────────────────
-
+// 1. THE TOOLTIP (Tailwind optimized)
 function GapTooltip({ active, payload }: TooltipProps<number, string>) {
   if (!active || !payload?.length) return null
-
-  // payload[0].payload is the raw GapDataPoint — avoids stacked-value confusion
   const d = payload[0].payload as GapDataPoint
   const isShort = d.shortage > 0
 
   return (
-    <div
-      style={{
-        background:   C.tooltipBg,
-        border:       `1px solid ${C.tooltipBorder}`,
-        borderRadius: 10,
-        padding:      "10px 14px",
-        fontSize:     12,
-        lineHeight:   1.7,
-        minWidth:     170,
-        boxShadow:    "0 8px 24px rgba(0,0,0,0.4)",
-      }}
-    >
-      <p style={{ color: C.axis, fontWeight: 600, marginBottom: 6, letterSpacing: "0.06em", fontSize: 10, textTransform: "uppercase" }}>
-        {d.time}
-      </p>
-      <p style={{ color: C.load }}>
-        <span style={{ color: "rgba(255,255,255,0.45)", display: "inline-block", width: 110 }}>Load</span>
-        <strong>{d.load.toFixed(0)} MW</strong>
-      </p>
-      <p style={{ color: C.supply }}>
-        <span style={{ color: "rgba(255,255,255,0.45)", display: "inline-block", width: 110 }}>Forecast Supply</span>
-        <strong>{d.supply.toFixed(0)} MW</strong>
-      </p>
-      <hr style={{ border: "none", borderTop: `1px solid ${C.tooltipBorder}`, margin: "7px 0" }} />
-      <p style={{ color: isShort ? C.shortage : C.supply, fontWeight: 700 }}>
-        <span style={{ color: "rgba(255,255,255,0.45)", fontWeight: 400, display: "inline-block", width: 110 }}>Net Position</span>
-        {isShort
-          ? `+${d.shortage.toFixed(0)} MW Short`
-          : `-${d.surplus.toFixed(0)} MW Long`}
-      </p>
+    <div className="min-w-[220px] rounded-xl border border-slate-200 bg-white p-4 shadow-xl shadow-slate-200/50">
+      <div className="flex justify-between items-center mb-3">
+        <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+          {d.time} Profile
+        </p>
+        <span className="text-[10px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">
+          €{d.hourlyPrice.toFixed(2)}/MWh
+        </span>
+      </div>
+      
+      <div className="flex justify-between items-center mb-1">
+        <span className="text-xs text-slate-600">Consumption</span>
+        <span className="text-sm font-bold text-blue-400">{d.load.toFixed(0)} MW</span>
+      </div>
+
+      <div className="flex justify-between items-center text-[11px] text-slate-50">
+        <span>Wind PPA</span>
+        <span className="font-semibold text-sky-400">{d.wind.toFixed(0)} MW</span>
+      </div>
+
+      <div className="flex justify-between items-center text-[11px] text-slate-500 mb-2">
+        <span>Solar PPA</span>
+        <span className="font-semibold text-amber-400">{d.solar.toFixed(0)} MW</span>
+      </div>
+
+      <div className={cn(
+        "mt-2 p-2.5 rounded-lg flex justify-between items-center",
+        isShort ? "bg-red-50 text-red-600" : "bg-sky-50 text-sky-600"
+      )}>
+        <span className="text-[11px] font-bold uppercase">{isShort ? 'Spot Exposure' : 'Net Surplus'}</span>
+        <span className="text-sm font-extrabold">{isShort ? `${d.shortage.toFixed(0)} MW` : `${d.surplus.toFixed(0)} MW`}</span>
+      </div>
     </div>
   )
 }
-
-// ─── Component ────────────────────────────────────────────────────────────────
 
 interface ForecastChartProps {
   data: GapDataPoint[]
 }
 
+// 2. THE MAIN CHART COMPONENT
 export function ForecastChart({ data }: ForecastChartProps) {
   return (
-    <div
-      style={{ background: C.bg, borderRadius: 12 }}
-      className="w-full overflow-hidden"
-    >
-      <ResponsiveContainer width="100%" height={320}>
-        <ComposedChart
-          data={data}
-          margin={{ top: 16, right: 16, bottom: 0, left: 4 }}
-        >
-          <defs>
-            {/* Subtle gradient for supply area */}
-            <linearGradient id="supplyGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%"   stopColor={C.supply}  stopOpacity={0.65} />
-              <stop offset="100%" stopColor={C.supply}  stopOpacity={0.20} />
-            </linearGradient>
-            {/* Gradient for shortage area */}
-            <linearGradient id="shortageGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%"   stopColor={C.shortage} stopOpacity={0.50} />
-              <stop offset="100%" stopColor={C.shortage} stopOpacity={0.15} />
-            </linearGradient>
-          </defs>
+    <div className="w-full bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+      <div className="p-4 pb-0">
+        <ResponsiveContainer width="100%" height={380}>
+          <ComposedChart data={data} margin={{ top: 24, right: 8, bottom: 0, left: 0 }}>
+            <defs>
+              <linearGradient id="windGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={COLORS.wind} stopOpacity={0.4} />
+                <stop offset="100%" stopColor={COLORS.wind} stopOpacity={0.05} />
+              </linearGradient>
+              <linearGradient id="solarGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={COLORS.solar} stopOpacity={0.5} />
+                <stop offset="100%" stopColor={COLORS.solar} stopOpacity={0.1} />
+              </linearGradient>
+              <linearGradient id="shortageGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={COLORS.shortage} stopOpacity={0.3} />
+                <stop offset="100%" stopColor={COLORS.shortage} stopOpacity={0} />
+              </linearGradient>
+            </defs>
 
-          <CartesianGrid
-            strokeDasharray="3 3"
-            stroke={C.grid}
-            vertical={false}
-          />
+            <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} vertical={false} />
 
-          <XAxis
-            dataKey="time"
-            tick={{ fill: C.axis, fontSize: 11 }}
-            tickLine={false}
-            axisLine={{ stroke: "rgba(255,255,255,0.10)" }}
-            interval={3}
-          />
+            <XAxis 
+              dataKey="time" 
+              tick={{ fill: COLORS.axis, fontSize: 11, fontWeight: 600 }} 
+              tickLine={false} 
+              axisLine={false} 
+              interval={2} 
+            />
 
-          <YAxis
-            tick={{ fill: C.axis, fontSize: 11 }}
-            tickLine={false}
-            axisLine={false}
-            tickFormatter={(v: number) => `${v}`}
-            unit=" MW"
-            width={64}
-          />
+            {/* Clean Y-Axes */}
+            <YAxis yAxisId="left" tick={{ fill: COLORS.axis, fontSize: 11 }} tickLine={false} axisLine={false} unit=" MW" width={60} />
+            <YAxis yAxisId="right" orientation="right" tick={{ fill: COLORS.axis, fontSize: 10, fontWeight: 700 }} tickLine={false} axisLine={false} unit=" €" width={50} />
 
-          <Tooltip
-            content={<GapTooltip />}
-            cursor={{ stroke: "rgba(255,255,255,0.12)", strokeWidth: 1 }}
-          />
+            <Tooltip content={<GapTooltip />} cursor={{ stroke: '#f1f5f9', strokeWidth: 2 }} />
 
-          {/*
-            Stack: supply (green) + shortage (red) stacked on top.
-            When shortage > 0: green shows 0→supply, red shows supply→load.
-            When surplus:     shortage=0, only green shows — extends above load line.
-          */}
-          <Area
-            stackId="gap"
-            type="monotone"
-            dataKey="supply"
-            stroke={C.supply}
-            strokeWidth={1.5}
-            fill="url(#supplyGrad)"
-            isAnimationActive={false}
-            dot={false}
-            activeDot={false}
-          />
-          <Area
-            stackId="gap"
-            type="monotone"
-            dataKey="shortage"
-            stroke="none"
-            fill="url(#shortageGrad)"
-            isAnimationActive={false}
-            dot={false}
-            activeDot={false}
-          />
+            {/* Rail Context Lines */}
+            <ReferenceLine yAxisId="left" y={0} stroke="#e2e8f0" strokeWidth={2} />
+            <ReferenceLine yAxisId="left" x="07:00" stroke="transparent">
+              <Label value="Morning Peak" position="top" fill="#cbd5e1" fontSize={10} fontWeight={700} dy={-10} />
+            </ReferenceLine>
+            <ReferenceLine yAxisId="left" x="18:00" stroke="transparent">
+              <Label value="Evening Peak" position="top" fill="#cbd5e1" fontSize={10} fontWeight={700} dy={-10} />
+            </ReferenceLine>
 
-          {/* Load line — sits on top of the areas */}
-          <Line
-            type="monotone"
-            dataKey="load"
-            stroke={C.load}
-            strokeWidth={2.5}
-            dot={false}
-            activeDot={{ r: 4, fill: C.load, strokeWidth: 0 }}
-            isAnimationActive={false}
-          />
-        </ComposedChart>
-      </ResponsiveContainer>
+            {/* Stacked Areas */}
+            <Area yAxisId="left" stackId="supply" dataKey="wind" stroke={COLORS.wind} fill="url(#windGrad)" isAnimationActive={false} />
+            <Area yAxisId="left" stackId="supply" dataKey="solar" stroke={COLORS.solar} fill="url(#solarGrad)" isAnimationActive={false} />
+            <Area yAxisId="left" type="monotone" dataKey="shortage" stroke="none" fill="url(#shortageGrad)" isAnimationActive={false} />
+            
+            {/* The Market Price & Consumption Lines */}
+            <Line yAxisId="right" type="stepAfter" dataKey="hourlyPrice" stroke={COLORS.priceLine} strokeWidth={1.5} strokeDasharray="4 4" dot={false} isAnimationActive={false} />
+            <Line yAxisId="left" type="monotone" dataKey="load" stroke={COLORS.load} strokeWidth={3} dot={false} isAnimationActive={false} />
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* 3. THE LEGEND (Standardized Row) */}
+    
     </div>
   )
 }

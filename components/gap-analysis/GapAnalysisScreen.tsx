@@ -92,23 +92,24 @@ export function GapAnalysisScreen({
           <ForecastChart data={data} />
 
           {/* Legend + microcopy */}
-          <div className="flex flex-wrap items-center gap-4 px-1">
-            <div className="flex items-center gap-1.5">
-              <span className="block h-3 w-3 rounded-sm" style={{ background: "rgba(52,211,153,0.65)" }} />
-              <span className="text-xs text-muted-foreground">Renewable supply</span>
+          <div className="flex flex-wrap justify-center gap-x-8 gap-y-2 py-4 border-t border-slate-50">
+          {[
+            { label: 'Consumption', color: '#60a5fa', type: 'line' },
+            { label: 'Wind PPA', color: '#38bdf8', type: 'area' },
+            { label: 'Solar PPA', color: '#fbbf24', type: 'area' },
+            { label: 'Residual Risk', color: '#f87171', type: 'area' },
+            { label: 'Expected Day-Ahead Price', color: '#94a3b8', type: 'dashed' }
+          ].map((item) => (
+            <div key={item.label} className="flex items-center gap-2">
+              {item.type === 'line' && <div className="w-4 h-0.5" style={{ backgroundColor: item.color }} />}
+              {item.type === 'area' && <div className="w-3 h-3 rounded-sm" style={{ backgroundColor: item.color, opacity: 0.7 }} />}
+              {item.type === 'dashed' && <div className="w-4 h-0.5 border-t-2 border-dashed" style={{ borderColor: item.color }} />}
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-tight">
+                {item.label}
+              </span>
             </div>
-            <div className="flex items-center gap-1.5">
-              <span className="block h-0.5 w-5 rounded-full bg-blue-400" />
-              <span className="text-xs text-muted-foreground">Load demand</span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <span className="block h-3 w-3 rounded-sm" style={{ background: "rgba(248,113,113,0.45)" }} />
-              <span className="text-xs text-muted-foreground">Procurement gap</span>
-            </div>
-            <span className="ml-auto text-[11px] italic text-muted-foreground/60">
-              Red areas indicate hours where procurement is required.
-            </span>
-          </div>
+          ))}
+        </div>
 
           {/* Hourly breakdown strip — compact heat-row */}
           <HourlyStrip data={data} />

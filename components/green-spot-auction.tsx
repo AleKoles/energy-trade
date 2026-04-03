@@ -1485,9 +1485,9 @@ export function GreenSpotAuction() {
       <div className="flex h-[100dvh] max-h-[900px] w-full max-w-6xl flex-col overflow-hidden rounded-none border-0 border-gray-200 bg-white shadow-2xl sm:rounded-2xl sm:border md:h-[90vh] md:flex-row md:rounded-2xl">
 
         {/* Desktop sidebar — always visible */}
-        <div className="hidden min-h-0 w-[35%] min-w-[280px] max-w-[380px] shrink-0 flex-col border-r border-gray-200 bg-white p-8 md:flex">
-          {StepperContentDesktop}
-        </div>
+        <div className="hidden min-h-0 w-[240px] shrink-0 flex-col border-r border-gray-100 bg-white p-6 md:flex">
+  {StepperContentDesktop}
+</div>
 
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] md:pb-0">
 
