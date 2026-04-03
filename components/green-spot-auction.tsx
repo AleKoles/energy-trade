@@ -13,12 +13,14 @@ import {
 import { AnimatePresence, motion } from "framer-motion"
 import {
   AlertCircle,
+  CalendarDays,
   Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
   Copy,
+  FileText,
   Leaf,
   Moon,
   MoreHorizontal,
@@ -42,6 +44,9 @@ import {
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { generateReferencePrices } from "@/lib/pricing"
+import { GapAnalysisScreen } from "@/components/gap-analysis/GapAnalysisScreen"
+import { useGapData, type ConfidenceLevel, type WeatherModel } from "@/components/gap-analysis/useGapData"
+import { BiddingGrid } from "@/components/bidding-grid/BiddingGrid"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -79,12 +84,13 @@ const SECTIONS: Array<{
 ]
 
 const STEPS = [
-  { id: 1, label: "Setup",     description: "Market & session settings" },
-  { id: 2, label: "Bid Entry", description: "Enter hourly bids" },
-  { id: 3, label: "Review",    description: "Confirm and submit" },
+  { id: 1, label: "Data Setup",    description: "Define load for next 24h" },
+  { id: 2, label: "Gap Analysis",  description: "Forecast gap & shortages" },
+  { id: 3, label: "Bid Entry",     description: "Enter hourly bids" },
+  { id: 4, label: "Review",        description: "Confirm and submit" },
 ]
 
-type DataSource = "session" | "scratch" | "csv"
+type DataSource = "session" | "scratch" | "csv" | "template"
 
 const HOURS = Array.from({ length: 24 }, (_, i) => {
   const start = i.toString().padStart(2, "0")
@@ -182,7 +188,7 @@ function parseDraft(raw: string | null): {
     if (mt0 === "intraday" && hourlyBids.length === 24) hourlyBids = expand24To96(hourlyBids)
     else if (mt0 === "day-ahead" && hourlyBids.length === 96) hourlyBids = collapse96To24(hourlyBids)
     const currentStep =
-      typeof parsed.currentStep === "number" && parsed.currentStep >= 1 && parsed.currentStep <= 3
+      typeof parsed.currentStep === "number" && parsed.currentStep >= 1 && parsed.currentStep <= 4
         ? parsed.currentStep : 2
     return { hourlyBids, marketType: mt0, currentStep }
   } catch { return null }
@@ -266,8 +272,14 @@ export function GreenSpotAuction() {
   const [flashedRows, setFlashedRows] = useState<ReadonlySet<number>>(new Set())
   const [selectedRows, setSelectedRows] = useState<ReadonlySet<number>>(new Set())
   const [collapsedSections, setCollapsedSections] = useState<ReadonlySet<SectionId>>(new Set())
-  const [dataSource, setDataSource] = useState<DataSource>("session")
+  const [dataSource, setDataSource] = useState<DataSource | null>(null)
+  const [csvFile, setCsvFile] = useState<File | null>(null)
+  const [isDragOver, setIsDragOver] = useState(false)
+  const [gateCountdown, setGateCountdown] = useState("--:--:--")
+  const [lastBidDate, setLastBidDate] = useState<string | null>(null)
   const [submitted, setSubmitted] = useState(false)
+  const [confidence,   setConfidence]   = useState<ConfidenceLevel>("P50")
+  const [weatherModel, setWeatherModel] = useState<WeatherModel>("ECMWF")
 
   const draftSavedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mobileFieldRef = useRef<BidField>("volume")
@@ -323,19 +335,51 @@ export function GreenSpotAuction() {
   }, [isMobile, hourlyBids.length])
 
   useEffect(() => {
+    const tick = () => {
+      try {
+        const now = new Date()
+        const cetStr = now.toLocaleString("en-US", {
+          timeZone: "Europe/Paris", hour12: false,
+          hour: "numeric", minute: "numeric", second: "numeric",
+        })
+        const parts = cetStr.split(":").map(Number)
+        const cetSec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+        const gateSec = 11 * 3600
+        const diff = gateSec > cetSec ? gateSec - cetSec : 24 * 3600 - cetSec + gateSec
+        const hh = Math.floor(diff / 3600).toString().padStart(2, "0")
+        const mm = Math.floor((diff % 3600) / 60).toString().padStart(2, "0")
+        const ss = (diff % 60).toString().padStart(2, "0")
+        setGateCountdown(`${hh}:${mm}:${ss}`)
+      } catch { setGateCountdown("--:--:--") }
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  useEffect(() => {
     if (typeof window === "undefined") return
-    const draft = parseDraft(localStorage.getItem(STORAGE_KEY))
+    const raw = localStorage.getItem(STORAGE_KEY)
+    const draft = parseDraft(raw)
     if (draft) {
       setHourlyBids(draft.hourlyBids)
       setMarketType(draft.marketType)
       setCurrentStep(draft.currentStep)
+      try {
+        const parsed = JSON.parse(raw!) as { savedAt?: string }
+        if (parsed.savedAt) {
+          setLastBidDate(new Date(parsed.savedAt).toLocaleDateString("en-GB", {
+            day: "numeric", month: "short", year: "numeric",
+          }))
+        }
+      } catch { /* ignore */ }
     }
     setDraftHydrated(true)
   }, [])
 
   useEffect(() => {
     if (!draftHydrated || typeof window === "undefined") return
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hourlyBids, marketType, currentStep }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hourlyBids, marketType, currentStep, savedAt: new Date().toISOString() }))
     if (draftSavedTimerRef.current) clearTimeout(draftSavedTimerRef.current)
     setDraftSaved(true)
     draftSavedTimerRef.current = setTimeout(() => setDraftSaved(false), 1800)
@@ -360,6 +404,21 @@ export function GreenSpotAuction() {
     }
     return { totalVolume: vol, estimatedMaxSpend: spend, filledSlots: filled }
   }, [hourlyBids, mwhMultiplier, refPrices])
+
+  // Step 1: ready to proceed when source is chosen (csv requires a file)
+  const dataReady = dataSource !== null && (dataSource !== "csv" || csvFile !== null)
+
+  // 24 hourly load values passed to the Gap Analysis chart
+  const loadMW = useMemo((): number[] => {
+    if (!isIntraday) return hourlyBids.map((b) => b.volume)
+    return Array.from({ length: 24 }, (_, h) => {
+      const slots = hourlyBids.slice(h * 4, h * 4 + 4)
+      return slots.reduce((sum, b) => sum + b.volume, 0) / 4
+    })
+  }, [hourlyBids, isIntraday])
+
+  // Gap analysis data — single source of truth for Step 3
+  const gapData = useGapData(loadMW, confidence, weatherModel)
 
   // At least one row with both fields filled
   const canContinue = useMemo(
@@ -445,14 +504,12 @@ export function GreenSpotAuction() {
   const handleApplyFirstToAll = () => {
     const { volume, price } = hourlyBids[0]
     setHourlyBids((prev) => prev.map((row, i) => i === 0 ? row : { ...row, volume, price }))
-    flashRows(new Set(hourlyBids.map((_, i) => i).filter((i) => i > 0)))
   }
 
   const handleCopyDown = useCallback((fromIndex: number) => {
     const { volume, price } = hourlyBids[fromIndex]
     setHourlyBids((prev) => prev.map((r, i) => i > fromIndex ? { ...r, volume, price } : r))
-    flashRows(new Set(Array.from({ length: slotCount - fromIndex - 1 }, (_, k) => fromIndex + 1 + k)))
-  }, [hourlyBids, slotCount])
+  }, [hourlyBids])
 
   const handleApplyToSelected = useCallback(() => {
     if (selectedRows.size === 0) return
@@ -515,6 +572,8 @@ export function GreenSpotAuction() {
   const handleStartBidding = useCallback(() => {
     if (dataSource === "scratch") {
       setHourlyBids(createDefaultBids(marketType))
+    } else if (dataSource === "template") {
+      setHourlyBids(createDefaultBids(marketType).map((row) => ({ ...row, volume: 50 })))
     }
     // "session" keeps existing bids (already loaded); "csv" placeholder: no-op
     setCurrentStep(2)
@@ -542,6 +601,39 @@ export function GreenSpotAuction() {
     )
     setSelectedRows(new Set())
   }, [selectedRows])
+
+  // ── Stage 3 handlers (called by BiddingGrid) ─────────────────────────────
+
+  const handleSyncVolumesToGap = useCallback((indices?: ReadonlySet<number>) => {
+    setHourlyBids((prev) =>
+      prev.map((row, i) => {
+        if (indices && !indices.has(i)) return row
+        const hourI = isIntraday ? Math.floor(i / 4) : i
+        const gap = gapData[hourI]?.gap ?? 0
+        const slotGap = isIntraday ? Math.round((gap / 4) * 10) / 10 : gap
+        return { ...row, volume: Math.max(slotGap, 0) }
+      })
+    )
+  }, [gapData, isIntraday])
+
+  const handleInitPrices = useCallback(() => {
+    setHourlyBids((prev) =>
+      prev.map((row, i) =>
+        row.price === null
+          ? { ...row, price: parseFloat((refPrices[i] * 1.05).toFixed(2)) }
+          : row
+      )
+    )
+  }, [refPrices])
+
+  const handleSyncPrices = useCallback((indices?: ReadonlySet<number>) => {
+    setHourlyBids((prev) =>
+      prev.map((row, i) => {
+        if (indices && !indices.has(i)) return row
+        return { ...row, price: parseFloat((refPrices[i] * 1.05).toFixed(2)) }
+      })
+    )
+  }, [refPrices])
 
   // ── Sidebar stepper (desktop) ─────────────────────────────────────────────
 
@@ -1004,160 +1096,234 @@ export function GreenSpotAuction() {
     </div>
   )
 
-  // ── Step 1: Setup ─────────────────────────────────────────────────────────
+  // ── Step 1: Data Setup ────────────────────────────────────────────────────
 
-  const renderStep1 = () => (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      {/* Desktop header */}
-      <div className="hidden items-center justify-between border-b border-gray-200 bg-white px-6 py-4 sm:px-8 sm:py-5 md:flex">
-        <div>
-          <h1 className="text-lg font-bold text-foreground sm:text-xl">Auction Setup</h1>
-          <p className="text-xs text-muted-foreground sm:text-sm">Select market type and session data source</p>
-        </div>
-        <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
-          <X className="h-5 w-5" />
-        </button>
-      </div>
+  const renderStep1 = () => {
+    const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragOver(true) }
+    const handleDragLeave = () => setIsDragOver(false)
+    const handleDrop = (e: React.DragEvent) => {
+      e.preventDefault()
+      setIsDragOver(false)
+      const file = e.dataTransfer.files[0]
+      if (file) { setCsvFile(file); setDataSource("csv") }
+    }
+    const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0]
+      if (file) { setCsvFile(file); setDataSource("csv") }
+    }
 
-      <div className="flex-1 overflow-auto px-5 py-6 sm:px-8 sm:py-8">
-        <div className="mx-auto max-w-lg space-y-7">
-
-          {/* Market Type */}
-          <div>
-            <p className="text-sm font-semibold text-foreground">Market Type</p>
-            <p className="mt-0.5 text-xs text-muted-foreground">Determines slot granularity for this session</p>
-            <div className="mt-3 inline-flex rounded-xl border border-gray-200 bg-gray-50 p-1 shadow-sm">
-              <button
-                type="button"
-                onClick={() => handleMarketTypeChange("day-ahead")}
-                className={cn(
-                  "flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all",
-                  marketType === "day-ahead"
-                    ? "bg-primary text-primary-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
-              >
-                <Sun className="h-4 w-4" />
-                Day-Ahead
-                <span className={cn("text-[10px]", marketType === "day-ahead" ? "text-primary-foreground/70" : "text-muted-foreground/60")}>
-                  24h slots
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleMarketTypeChange("intraday")}
-                className={cn(
-                  "flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all",
-                  marketType === "intraday"
-                    ? "bg-primary text-primary-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
-              >
-                <Clock className="h-4 w-4" />
-                Intraday
-                <span className={cn("text-[10px]", marketType === "intraday" ? "text-primary-foreground/70" : "text-muted-foreground/60")}>
-                  96 × 15m
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* Gate Closure */}
-          <div className={cn(
-            "flex items-start gap-3 rounded-xl border p-4",
-            nearClosure
-              ? "border-[#ffdc45]/50 bg-[#ffdc45]/8"
-              : "border-gray-200 bg-gray-50"
-          )}>
-            <Clock className={cn("mt-0.5 h-4 w-4 shrink-0", nearClosure ? "text-amber-600" : "text-muted-foreground")} />
+    return (
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Desktop header */}
+        <div className="hidden items-center justify-between border-b border-gray-200 bg-white px-6 py-4 sm:px-8 sm:py-5 md:flex">
+          <div className="flex items-center gap-3">
             <div>
-              <p className={cn("text-sm font-medium", nearClosure ? "text-amber-800" : "text-foreground")}>
-                Auction closes at 11:00 CET
-              </p>
-              <p className={cn("mt-0.5 text-xs", nearClosure ? "text-amber-700" : "text-muted-foreground")}>
-                {nearClosure
-                  ? "Gate closing soon — submit your bid before the deadline"
-                  : "Day-Ahead gate closure · submit before 11:00"}
-              </p>
+              <div className="flex items-center gap-2">
+                <h1 className="text-lg font-bold text-foreground sm:text-xl">Data Setup</h1>
+                <span className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Step 1 / 4
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground sm:text-sm">Define the load profile for the next 24 hours</p>
             </div>
           </div>
+          <div className="flex items-center gap-3">
+            {/* Live gate countdown */}
+            <div className={cn(
+              "flex items-center gap-2 rounded-lg border px-3 py-2",
+              nearClosure ? "border-amber-200 bg-amber-50" : "border-gray-200 bg-gray-50"
+            )}>
+              <Clock className={cn("h-3.5 w-3.5 shrink-0", nearClosure ? "text-amber-600" : "text-muted-foreground")} />
+              <div>
+                <p className={cn("text-[10px] font-medium uppercase tracking-wide leading-none", nearClosure ? "text-amber-600" : "text-muted-foreground")}>
+                  Time to Gate
+                </p>
+                <p className={cn("mt-0.5 font-mono text-sm font-bold tabular-nums leading-none", nearClosure ? "text-amber-700" : "text-foreground")}>
+                  {gateCountdown}
+                </p>
+              </div>
+            </div>
+            <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+        </div>
 
-          {/* Data Source */}
-          <div>
-            <p className="text-sm font-semibold text-foreground">Session Data</p>
-            <p className="mt-0.5 mb-3 text-xs text-muted-foreground">Choose how to populate bid slots for this session</p>
-            <div className="space-y-2">
-              {(["session", "scratch", "csv"] as const).map((src) => {
-                const meta: Record<DataSource, { title: string; desc: string }> = {
-                  session: { title: "Use Last Session Values", desc: "Restore bids from your previous session" },
-                  scratch: { title: "Start from Scratch", desc: "Begin with empty bid slots" },
-                  csv:     { title: "Upload CSV", desc: "Import bid values from a spreadsheet" },
-                }
-                const selected = dataSource === src
-                return (
-                  <label
-                    key={src}
+        <div className="flex-1 overflow-auto px-5 py-6 sm:px-8 sm:py-8">
+          <div className="mx-auto max-w-3xl">
+            <div className="grid gap-6 md:grid-cols-2">
+
+              {/* Left panel: CSV upload */}
+              <div className="flex flex-col gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-foreground">Typical Load Profile</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">Upload 24h load data.</p>
+                </div>
+                <label
+                  onDragOver={handleDragOver}
+                  onDragLeave={handleDragLeave}
+                  onDrop={handleDrop}
+                  className={cn(
+                    "relative flex flex-1 cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-12 text-center transition-colors",
+                    dataSource === "csv" && csvFile
+                      ? "border-primary/40 bg-primary/[0.03]"
+                      : isDragOver
+                      ? "border-primary/60 bg-primary/[0.04]"
+                      : "border-gray-200 bg-gray-50 hover:border-gray-300 hover:bg-gray-100/50"
+                  )}
+                >
+                  <input type="file" accept=".csv" className="sr-only" onChange={handleFileInput} />
+                  {dataSource === "csv" && csvFile ? (
+                    <>
+                      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
+                        <FileText className="h-6 w-6 text-primary" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{csvFile.name}</p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">File ready · click to replace</p>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className={cn(
+                        "flex h-12 w-12 items-center justify-center rounded-full transition-colors",
+                        isDragOver ? "bg-primary/10" : "bg-gray-100"
+                      )}>
+                        <Upload className={cn("h-6 w-6 transition-colors", isDragOver ? "text-primary" : "text-muted-foreground")} />
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-foreground">
+                          {isDragOver ? "Drop to upload" : "Drag & drop CSV"}
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          or <span className="text-primary underline-offset-2 hover:underline">click to browse</span>
+                        </p>
+                      </div>
+                    </>
+                  )}
+                </label>
+              </div>
+
+              {/* Right panel: Quick select */}
+              <div className="flex flex-col gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-foreground">Quick Select</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">Or choose a starting point for this session.</p>
+                </div>
+                <div className="flex flex-col gap-2">
+
+                  {/* Use Last Successful Bid */}
+                  <button
+                    type="button"
+                    onClick={() => setDataSource("session")}
                     className={cn(
-                      "flex cursor-pointer items-start gap-3 rounded-xl border p-4 transition-colors",
-                      selected ? "border-primary/30 bg-primary/[0.04]" : "border-gray-200 hover:bg-gray-50"
+                      "flex items-center gap-3 rounded-xl border p-4 text-left transition-colors",
+                      dataSource === "session"
+                        ? "border-primary/30 bg-primary/[0.04]"
+                        : "border-gray-200 hover:bg-gray-50"
                     )}
                   >
-                    <input
-                      type="radio"
-                      name="dataSource"
-                      value={src}
-                      checked={selected}
-                      onChange={() => setDataSource(src)}
-                      className="sr-only"
-                    />
                     <div className={cn(
-                      "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 transition-colors",
-                      selected ? "border-primary" : "border-gray-300"
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
+                      dataSource === "session" ? "bg-primary/10" : "bg-gray-100"
                     )}>
-                      {selected && <div className="h-2 w-2 rounded-full bg-primary" />}
+                      <RefreshCw className={cn("h-4 w-4", dataSource === "session" ? "text-primary" : "text-muted-foreground")} />
                     </div>
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium text-foreground">{meta[src].title}</span>
-                        {src === "csv" && (
-                          <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                            UI only
-                          </span>
-                        )}
-                      </div>
-                      <p className="mt-0.5 text-xs text-muted-foreground">{meta[src].desc}</p>
-
-                      {/* CSV drop zone — placeholder only */}
-                      {src === "csv" && selected && (
-                        <div className="mt-3 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 px-4 py-8 text-center">
-                          <Upload className="h-7 w-7 text-muted-foreground/30" />
-                          <div>
-                            <p className="text-xs font-medium text-muted-foreground">Drag & drop a .csv file</p>
-                            <p className="mt-0.5 text-[10px] text-muted-foreground/60">or click to browse · not yet implemented</p>
-                          </div>
-                        </div>
-                      )}
+                      <p className="text-sm font-semibold text-foreground">Use Last Successful Bid</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {lastBidDate ? `Last session · ${lastBidDate}` : "Restore bids from previous session"}
+                      </p>
                     </div>
-                  </label>
-                )
-              })}
+                    {dataSource === "session" && (
+                      <div className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary">
+                        <Check className="h-2.5 w-2.5 text-white" strokeWidth={3} />
+                      </div>
+                    )}
+                  </button>
+
+                  {/* Load Template */}
+                  <button
+                    type="button"
+                    onClick={() => setDataSource("template")}
+                    className={cn(
+                      "flex items-center gap-3 rounded-xl border p-4 text-left transition-colors",
+                      dataSource === "template"
+                        ? "border-primary/30 bg-primary/[0.04]"
+                        : "border-gray-200 hover:bg-gray-50"
+                    )}
+                  >
+                    <div className={cn(
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
+                      dataSource === "template" ? "bg-primary/10" : "bg-gray-100"
+                    )}>
+                      <CalendarDays className={cn("h-4 w-4", dataSource === "template" ? "text-primary" : "text-muted-foreground")} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold text-foreground">Load Template</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">Standard weekday / weekend profiles</p>
+                    </div>
+                    {dataSource === "template" && (
+                      <div className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary">
+                        <Check className="h-2.5 w-2.5 text-white" strokeWidth={3} />
+                      </div>
+                    )}
+                  </button>
+
+                  {/* Start Blank */}
+                  <button
+                    type="button"
+                    onClick={() => setDataSource("scratch")}
+                    className={cn(
+                      "flex items-center gap-3 rounded-xl border p-4 text-left transition-colors",
+                      dataSource === "scratch"
+                        ? "border-primary/30 bg-primary/[0.04]"
+                        : "border-gray-200 hover:bg-gray-50"
+                    )}
+                  >
+                    <div className={cn(
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
+                      dataSource === "scratch" ? "bg-primary/10" : "bg-gray-100"
+                    )}>
+                      <Zap className={cn("h-4 w-4", dataSource === "scratch" ? "text-primary" : "text-muted-foreground")} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold text-foreground">Start Blank</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">Manual entry — empty bid slots</p>
+                    </div>
+                    {dataSource === "scratch" && (
+                      <div className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary">
+                        <Check className="h-2.5 w-2.5 text-white" strokeWidth={3} />
+                      </div>
+                    )}
+                  </button>
+
+                </div>
+              </div>
+
             </div>
           </div>
         </div>
-      </div>
 
-      {/* Footer */}
-      <div className="shrink-0 border-t border-gray-200 bg-white px-5 py-4 sm:flex sm:items-center sm:justify-end sm:px-8">
-        <button
-          type="button"
-          onClick={handleStartBidding}
-          className="w-full rounded-xl bg-primary px-8 py-3 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 sm:w-auto"
-        >
-          Start Bidding →
-        </button>
+        {/* Footer */}
+        <div className="shrink-0 border-t border-gray-200 bg-white px-5 py-4 sm:flex sm:items-center sm:justify-end sm:px-8">
+          <button
+            type="button"
+            onClick={handleStartBidding}
+            disabled={!dataReady}
+            className={cn(
+              "w-full rounded-xl px-8 py-3 text-sm font-semibold shadow-sm transition-all sm:w-auto",
+              dataReady
+                ? "bg-primary text-primary-foreground hover:opacity-90"
+                : "cursor-not-allowed bg-gray-100 text-muted-foreground"
+            )}
+          >
+            Next: Analyze Forecast →
+          </button>
+        </div>
       </div>
-    </div>
-  )
+    )
+  }
 
   // ── Step 3: Review ────────────────────────────────────────────────────────
 
@@ -1280,7 +1446,7 @@ export function GreenSpotAuction() {
         <div className="hidden shrink-0 items-center justify-between border-t border-gray-200 bg-white px-6 py-4 sm:px-8 sm:py-5 md:flex">
           <button
             type="button"
-            onClick={() => setCurrentStep(2)}
+            onClick={() => setCurrentStep(3)}
             className="rounded-lg px-4 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground sm:px-6"
           >
             Back
@@ -1354,13 +1520,13 @@ export function GreenSpotAuction() {
 
             <div className="shrink-0 text-center">
               <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                {currentStep} / 3
+                {currentStep} / {STEPS.length}
               </p>
               <p className="text-xs font-bold text-foreground">{STEPS[currentStep - 1].label}</p>
             </div>
 
-            {/* Step 2 quick actions */}
-            {currentStep === 2 && (
+            {/* Step 3 quick actions */}
+            {currentStep === 3 && (
               <>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -1391,243 +1557,63 @@ export function GreenSpotAuction() {
           {/* ── Step 1 ──────────────────────────────────────────────────── */}
           {currentStep === 1 && renderStep1()}
 
-          {/* ── Step 2: Bid Entry ───────────────────────────────────────── */}
+          {/* ── Step 2: Gap Analysis ────────────────────────────────────── */}
           {currentStep === 2 && (
-            <>
-              {/* Desktop header */}
-              <div className="hidden items-center justify-between border-b border-gray-200 bg-white px-6 py-3.5 sm:px-8 md:flex">
-                <div className="flex items-center gap-3">
-                  <h1 className="text-base font-bold text-foreground sm:text-lg">Bid Entry</h1>
-                  {/* Read-only market type indicator — change only in Step 1 */}
-                  <span className="flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs font-medium text-muted-foreground">
-                    {isIntraday ? <Clock className="h-3.5 w-3.5" /> : <Sun className="h-3.5 w-3.5" />}
-                    {isIntraday ? "Intraday · 96 × 15m" : "Day-Ahead · 24h"}
-                  </span>
-                </div>
-                <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
-                  <X className="h-5 w-5" />
-                </button>
-              </div>
-
-              {/* Desktop control bar */}
-              <div className="hidden shrink-0 border-b border-gray-200 bg-gray-50/60 px-6 py-3 md:block sm:px-8">
-                <div className="flex flex-wrap items-center gap-3">
-                  {/* Price presets */}
-                  <div className="flex items-center gap-1.5 border-r border-gray-200 pr-3">
-                    <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">Price sync</span>
-                    <button
-                      type="button"
-                      onClick={handlePresetBaseLoad}
-                      className="flex items-center gap-1.5 rounded-md bg-primary/5 px-2.5 py-1.5 text-xs font-medium text-primary/80 ring-1 ring-primary/15 transition-colors hover:bg-primary/10"
-                    >
-                      <RefreshCw className="h-3 w-3" />
-                      Sync All Prices
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handlePresetPeakHours}
-                      className="flex items-center gap-1.5 rounded-md bg-primary/5 px-2.5 py-1.5 text-xs font-medium text-primary/80 ring-1 ring-primary/15 transition-colors hover:bg-primary/10"
-                    >
-                      <RefreshCw className="h-3 w-3" />
-                      Sync Peak (08–18)
-                    </button>
-                  </div>
-
-                  <div className="ml-auto flex items-center gap-1">
-                    <button type="button" onClick={handleApplyFirstToAll} className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
-                      Apply First to All
-                    </button>
-                    <button type="button" onClick={handleClearAll} className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
-                      Clear All
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Floating selection action bar — desktop */}
-              {selectedRows.size > 0 && (
-                <div className="hidden shrink-0 items-center gap-3 border-b border-primary/10 bg-primary/[0.04] px-6 py-2 sm:px-8 md:flex">
-                  <span className="text-xs font-medium text-primary/70">
-                    {selectedRows.size} row{selectedRows.size > 1 ? "s" : ""} selected
-                  </span>
-                  <div className="h-3.5 w-px bg-primary/20" />
-                  <button type="button" onClick={handleSyncSelectedToRef} className="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-primary/80 ring-1 ring-primary/20 transition-colors hover:bg-primary/10">
-                    <RefreshCw className="h-3 w-3" />
-                    Sync to REF
-                  </button>
-                  <button type="button" onClick={handleClearSelected} className="rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground ring-1 ring-gray-200 transition-colors hover:bg-gray-100">
-                    Clear Selected
-                  </button>
-                  <button type="button" onClick={() => setSelectedRows(new Set())} className="ml-auto flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-muted-foreground">
-                    <X className="h-3 w-3" /> Deselect
-                  </button>
-                </div>
-              )}
-
-              {/* Mobile hour stepper */}
-              <AnimatePresence>
-                {isMobile && mobileFocusIndex !== null && (
-                  <motion.div
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="sticky top-0 z-30 flex shrink-0 items-center justify-between gap-2 overflow-hidden border-b border-primary/20 bg-primary/5 px-3 py-2 md:hidden"
-                  >
-                    <button
-                      type="button"
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white text-primary shadow-sm ring-1 ring-gray-200"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => focusHourAtField(mobileFocusIndex - 1, mobileFieldRef.current)}
-                      disabled={mobileFocusIndex <= 0}
-                      aria-label="Previous hour"
-                    >
-                      <ChevronLeft className="h-5 w-5" />
-                    </button>
-                    <span className="text-center text-xs font-semibold text-foreground">
-                      {hourlyBids[mobileFocusIndex]?.hour ?? ""}
-                      <span className="block text-[10px] font-normal text-muted-foreground">{mobileFocusIndex + 1} / {slotCount}</span>
-                    </span>
-                    <button
-                      type="button"
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white text-primary shadow-sm ring-1 ring-gray-200"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => focusHourAtField(mobileFocusIndex + 1, mobileFieldRef.current)}
-                      disabled={mobileFocusIndex >= slotCount - 1}
-                      aria-label="Next hour"
-                    >
-                      <ChevronRight className="h-5 w-5" />
-                    </button>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
-              {/* Bid list */}
-              <div ref={listWrapRef} className="min-h-0 flex-1 overflow-hidden px-0 pb-28 pt-0 md:overflow-auto md:p-6 md:px-8 md:pb-4">
-                <AnimatePresence mode="wait">
-                  <motion.div
-                    key={marketType}
-                    initial={{ opacity: 0, y: 6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    transition={{ duration: 0.22, ease: "easeOut" }}
-                    className="flex h-full min-h-0 flex-col md:h-auto"
-                  >
-                    {isMobile ? (
-                      <VirtualList
-                        key={`${marketType}-${slotCount}`}
-                        rowCount={slotCount}
-                        rowHeight={MOBILE_ROW_H}
-                        rowComponent={MobileVirtualRow}
-                        rowProps={{}}
-                        overscanCount={6}
-                        defaultHeight={listHeight}
-                        style={{ height: listHeight, width: "100%" }}
-                      />
-                    ) : (
-                      renderDesktopTable()
-                    )}
-                  </motion.div>
-                </AnimatePresence>
-              </div>
-
-              {/* Desktop footer — Step 2 */}
-              {/*
-                Below lg  : stats row → warning row → buttons row (each full-width)
-                lg+       : single row, stats left · warning+buttons right
-              */}
-              <div className="hidden shrink-0 flex-col gap-2.5 border-t border-gray-200 bg-white px-6 py-3.5 sm:px-8 md:flex lg:flex-row lg:items-center lg:justify-between lg:gap-3 lg:py-4">
-
-                {/* Stats — always one horizontal row */}
-                <div className="flex items-center gap-2">
-                  <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
-                    <p className="text-[10px] text-muted-foreground">Total Volume</p>
-                    <p className="text-sm font-bold text-foreground lg:text-base">{totalVolume.toFixed(2)} MWh</p>
-                  </div>
-                  <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
-                    <p className="text-[10px] text-muted-foreground">Est. max spend</p>
-                    <p className="text-sm font-bold text-foreground lg:text-base">
-                      €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </p>
-                  </div>
-                  <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
-                    <p className="text-[10px] text-muted-foreground">Active slots</p>
-                    <p className="text-sm font-bold text-foreground lg:text-base">{filledSlots} / {slotCount}</p>
-                  </div>
-                  <span className={cn("ml-1 text-[10px] font-medium transition-opacity duration-500", draftSaved ? "text-emerald-600 opacity-100" : "opacity-0")} aria-live="polite">
-                    ✓ Draft saved
-                  </span>
-                </div>
-
-                {/* Warning text — own row below lg, inline at lg+ */}
-                {(!canContinue || draftCount > 0) && (
-                  <div className="flex items-center gap-1 lg:hidden">
-                    {!canContinue ? (
-                      <>
-                        <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-                        <span className="text-xs text-muted-foreground">Fill MW + Price on at least one slot</span>
-                      </>
-                    ) : (
-                      <span className="text-xs text-amber-600/80">
-                        {draftCount} incomplete {draftCount === 1 ? "row" : "rows"} will be skipped
-                      </span>
-                    )}
-                  </div>
-                )}
-
-                {/* Buttons + inline warning at lg+ */}
-                <div className="flex items-center justify-between gap-3 lg:justify-end">
-                  {/* Warning visible only lg+ */}
-                  <div className="hidden lg:flex lg:items-center lg:gap-1">
-                    {!canContinue && (
-                      <>
-                        <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-                        <span className="text-xs text-muted-foreground">Fill MW + Price on at least one slot</span>
-                      </>
-                    )}
-                    {canContinue && draftCount > 0 && (
-                      <span className="text-xs text-amber-600/80">
-                        {draftCount} incomplete {draftCount === 1 ? "row" : "rows"} will be skipped
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="flex gap-2">
-                    <button type="button" onClick={() => setCurrentStep(1)} className="rounded-lg px-4 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground lg:px-6">
-                      Back
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setCurrentStep(3)}
-                      disabled={!canContinue}
-                      className="rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 lg:px-6"
-                    >
-                      Review Bid
-                    </button>
-                  </div>
-                </div>
-
-              </div>
-            </>
+            <GapAnalysisScreen
+              loadMW={loadMW}
+              data={gapData}
+              confidence={confidence}
+              onConfidenceChange={setConfidence}
+              weatherModel={weatherModel}
+              onWeatherModelChange={setWeatherModel}
+              gateCountdown={gateCountdown}
+              nearClosure={nearClosure}
+              onBack={() => setCurrentStep(1)}
+              onNext={() => setCurrentStep(3)}
+              onClose={() => setIsOpen(false)}
+            />
           )}
 
-          {/* ── Step 3 ──────────────────────────────────────────────────── */}
-          {currentStep === 3 && renderStep3()}
+          {/* ── Step 3: Bid Entry ───────────────────────────────────────── */}
+          {currentStep === 3 && (
+            <BiddingGrid
+              gapData={gapData}
+              hourlyBids={hourlyBids}
+              refPrices={refPrices}
+              isIntraday={isIntraday}
+              mwhMultiplier={mwhMultiplier}
+              slotCount={slotCount}
+              isMobile={isMobile}
+              listHeight={listHeight}
+              listWrapRef={listWrapRef}
+              gateCountdown={gateCountdown}
+              nearClosure={nearClosure}
+              draftSaved={draftSaved}
+              totalVolume={totalVolume}
+              estimatedMaxSpend={estimatedMaxSpend}
+              filledSlots={filledSlots}
+              canContinue={canContinue}
+              draftCount={draftCount}
+              onVolumeChange={handleVolumeChange}
+              onPriceChange={handlePriceChange}
+              onBidKeyDown={handleBidKeyDown}
+              onSyncToGap={handleSyncVolumesToGap}
+              onSyncPrices={handleSyncPrices}
+              onInitPrices={handleInitPrices}
+              onCopyDown={handleCopyDown}
+              onApplyFirstToAll={handleApplyFirstToAll}
+              onClearAll={handleClearAll}
+              onBack={() => setCurrentStep(2)}
+              onNext={() => setCurrentStep(4)}
+              onClose={() => setIsOpen(false)}
+            />
+          )}
+
+          {/* ── Step 4: Review ──────────────────────────────────────────── */}
+          {currentStep === 4 && renderStep3()}
 
         </div>
       </div>
-
-      {/* Mobile FAB — Step 2 only */}
-      {currentStep === 2 && (
-        <button
-          type="button"
-          onClick={handleApplyFirstToAll}
-          className="fixed bottom-[calc(5.5rem+env(safe-area-inset-bottom))] right-4 z-40 flex h-12 w-12 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg ring-2 ring-white/90 transition hover:opacity-95 md:hidden"
-          aria-label="Apply first row to all slots"
-        >
-          <Copy className="h-5 w-5" />
-        </button>
-      )}
 
       {/* Mobile bottom bar — Step 1 */}
       {currentStep === 1 && (
@@ -1635,42 +1621,23 @@ export function GreenSpotAuction() {
           <button
             type="button"
             onClick={handleStartBidding}
-            className="w-full rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow-sm"
+            disabled={!dataReady}
+            className={cn(
+              "w-full rounded-xl py-3 text-sm font-semibold shadow-sm transition-all",
+              dataReady
+                ? "bg-primary text-primary-foreground"
+                : "cursor-not-allowed bg-gray-100 text-muted-foreground"
+            )}
           >
-            Start Bidding →
+            Next: Analyze Forecast →
           </button>
         </div>
       )}
 
-      {/* Mobile bottom bar — Step 2 */}
-      {currentStep === 2 && (
-        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-gray-200 bg-white/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-4px_24px_rgba(0,0,0,0.08)] backdrop-blur-sm md:hidden">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Total volume</p>
-              <p className="text-lg font-bold text-primary">
-                {totalVolume.toFixed(1)} <span className="text-sm font-semibold text-foreground">MWh</span>
-              </p>
-              {!canContinue && (
-                <p className="text-[10px] text-amber-600">Add MW + Price to continue</p>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={() => setCurrentStep(3)}
-              disabled={!canContinue}
-              className="min-w-[130px] rounded-xl bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              Review Bid
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Mobile bottom bar — Step 3 */}
-      {currentStep === 3 && !submitted && (
+      {/* Mobile bottom bar — Step 4 (Review) */}
+      {currentStep === 4 && !submitted && (
         <div className="fixed inset-x-0 bottom-0 z-40 flex items-center justify-between gap-3 border-t border-gray-200 bg-white/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-4px_24px_rgba(0,0,0,0.08)] backdrop-blur-sm md:hidden">
-          <button type="button" onClick={() => setCurrentStep(2)} className="rounded-xl px-5 py-3 text-sm font-semibold text-muted-foreground hover:bg-accent">
+          <button type="button" onClick={() => setCurrentStep(3)} className="rounded-xl px-5 py-3 text-sm font-semibold text-muted-foreground hover:bg-accent">
             Back
           </button>
           <button
