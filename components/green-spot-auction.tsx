@@ -55,9 +55,11 @@ import {
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { generateReferencePrices } from "@/lib/pricing"
+import { PRICE_CAP, PRICE_FLOOR } from "@/lib/clearing"
 import { GapAnalysisScreen } from "@/components/gap-analysis/GapAnalysisScreen"
 import { useGapData, type ConfidenceLevel, type WeatherModel } from "@/components/gap-analysis/useGapData"
 import { BiddingGrid } from "@/components/bidding-grid/BiddingGrid"
+import { PostTradeView } from "@/components/post-trade/PostTradeView"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -500,6 +502,12 @@ export function GreenSpotAuction() {
     [hourlyBids]
   )
 
+  // Any active bid with a price outside SDAC bounds blocks submission
+  const hasInvalidPrices = useMemo(
+    () => hourlyBids.some((b) => b.price !== null && (b.price > PRICE_CAP || b.price < PRICE_FLOOR)),
+    [hourlyBids]
+  )
+
   // ── Handlers ──────────────────────────────────────────────────────────────
 
   const updateBidRow = useCallback((index: number, patch: Partial<HourlyBidRow>) => {
@@ -524,7 +532,9 @@ export function GreenSpotAuction() {
   const handleVolumeChange = (index: number, raw: string) => {
     if (raw === "" || raw === "-") { updateBidRow(index, { volume: 0 }); return }
     const n = parseFloat(raw)
-    updateBidRow(index, { volume: Number.isNaN(n) ? 0 : n })
+    if (Number.isNaN(n)) { updateBidRow(index, { volume: 0 }); return }
+    // EPEX SPOT lot rounding: 0.1 MW minimum granularity
+    updateBidRow(index, { volume: Math.round(n * 10) / 10 })
   }
 
   const handlePriceChange = (index: number, raw: string) => {
@@ -1442,36 +1452,13 @@ export function GreenSpotAuction() {
 
     if (submitted) {
       return (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 p-8 text-center">
-          <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
-            <Check className="h-8 w-8 text-emerald-600" strokeWidth={2.5} />
-          </div>
-          <div>
-            <h2 className="text-xl font-bold text-foreground">Bid Submitted</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Delivery: {formatDeliveryDate(deliveryDate)}
-            </p>
-          </div>
-          <div className="rounded-xl border border-primary/20 bg-primary/5 px-8 py-5">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Total Volume</p>
-            <p className="mt-1 text-2xl font-bold text-primary">{totalVolume.toFixed(2)} MWh</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Est. max spend · €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </p>
-            {bidHash && (
-              <p className="mt-2 font-mono text-[10px] text-muted-foreground/60">
-                Audit ID: {bidHash}
-              </p>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={() => { setSubmitted(false); setCurrentStep(1); setHourlyBids(createDefaultBids(marketType)) }}
-            className="mt-1 text-sm font-medium text-primary hover:underline"
-          >
-            Start new session
-          </button>
-        </div>
+        <PostTradeView
+          activeBids={activeRows.map(({ bid }) => ({ hour: bid.hour, volume: bid.volume, price: bid.price! }))}
+          gapData={gapData}
+          bidHash={bidHash}
+          deliveryLabel={formatDeliveryDate(deliveryDate)}
+          onNewSession={() => { setSubmitted(false); setCurrentStep(1); setHourlyBids(createDefaultBids(marketType)) }}
+        />
       )
     }
 
@@ -1625,10 +1612,15 @@ export function GreenSpotAuction() {
           >
             Back
           </button>
+          {hasInvalidPrices && (
+            <p className="mr-2 text-xs font-medium text-red-500">
+              Fix out-of-range prices before submitting
+            </p>
+          )}
           <button
             type="button"
             onClick={handleSubmit}
-            disabled={activeRows.length === 0 || !remitChecks.every(Boolean)}
+            disabled={activeRows.length === 0 || !remitChecks.every(Boolean) || hasInvalidPrices}
             className="rounded-xl bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Submit Bid to Exchange

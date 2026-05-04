@@ -9,6 +9,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
+import { PRICE_CAP, PRICE_FLOOR } from "@/lib/clearing"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -164,6 +165,14 @@ function BiddingRowInner({
   const required  = Math.max(slotGap, 0)
   const suggested = refPrice > 0 ? refPrice * 1.05 : null
 
+  const priceError = price !== null
+    ? price > PRICE_CAP
+      ? `Exceeds SDAC cap (€${PRICE_CAP.toLocaleString()})`
+      : price < PRICE_FLOOR
+        ? `Below SDAC floor (€${PRICE_FLOOR})`
+        : null
+    : null
+
   const [priceFocused, setPriceFocused] = useState(false)
   const priceBlurRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -311,9 +320,11 @@ function BiddingRowInner({
           <TooltipTrigger asChild>
             <div className={cn(
               "flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition-colors focus-within:ring-2",
-              isDeviating
-                ? "border-amber-300 focus-within:ring-amber-300/40"
-                : "border-gray-200 focus-within:border-primary focus-within:ring-primary/20"
+              priceError
+                ? "border-red-400 focus-within:ring-red-300/40"
+                : isDeviating
+                  ? "border-amber-300 focus-within:ring-amber-300/40"
+                  : "border-gray-200 focus-within:border-primary focus-within:ring-primary/20"
             )}>
               <input
                 type="number"
@@ -331,13 +342,20 @@ function BiddingRowInner({
             </div>
           </TooltipTrigger>
           <TooltipContent side="top">
-            {isDeviating
-              ? "Bid volume deviates from forecasted shortage"
-              : suggested !== null
-                ? `Ref €${refPrice.toFixed(2)} · Suggested €${suggested.toFixed(2)}`
-                : "Enter limit price"}
+            {priceError
+              ? priceError
+              : isDeviating
+                ? "Bid volume deviates from forecasted shortage"
+                : suggested !== null
+                  ? `Ref €${refPrice.toFixed(2)} · Suggested €${suggested.toFixed(2)}`
+                  : "Enter limit price"}
           </TooltipContent>
         </Tooltip>
+        {priceError && (
+          <p className="absolute -bottom-4 right-0 text-[9px] font-semibold text-red-500 whitespace-nowrap">
+            {priceError}
+          </p>
+        )}
 
         {priceFocused && (
           <div className="absolute left-0 top-full z-30 mt-1 w-52 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg">
