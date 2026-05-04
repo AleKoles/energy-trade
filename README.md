@@ -1,8 +1,8 @@
-# Green SPOT Auction Portal ⚡️
+# Day-Ahead Auction Portal ⚡️
 
-A high-performance, three-stage energy trading terminal designed for **Day-Ahead** and **Intraday** renewable energy auctions. 
+A high-performance, three-stage energy trading terminal designed for **Day-Ahead** and **Intraday** (WIP) renewable energy auctions. 
 
-Built as a technical demonstration for **Otark**, this portal focuses on reducing "Time-to-Trade" and eliminating "Fat-Finger" errors in high-pressure, time-sensitive market environments.
+Built as a though experiment focusing on simplifying complex flows, reducing "Time-to-Trade" and eliminating "Fat-Finger" errors in high-pressure, time-sensitive market environments.
 
 ---
 
