@@ -11,8 +11,8 @@
   --card-foreground: #111827;
   --popover: #ffffff;
   --popover-foreground: #111827;
-  /* Otark Navy — primary brand color */
-  --primary: #0d4e75;
+  /* Electric blue — energy brand color */
+  --primary: #1264a8;
   --primary-foreground: #ffffff;
   --otark-accent: var(--primary);
   --otark-info: #5cb4d5;
@@ -53,7 +53,7 @@
   --card-foreground: oklch(0.97 0.005 85);
   --popover: oklch(0.20 0.04 260);
   --popover-foreground: oklch(0.97 0.005 85);
-  --primary: #0d4e75;
+  --primary: #1878ce;
   --primary-foreground: #ffffff;
   --otark-accent: var(--primary);
   --secondary: oklch(0.25 0.04 260);
