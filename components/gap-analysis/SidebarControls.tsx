@@ -43,6 +43,17 @@ export function SidebarControls({
   const hoursAtRisk     = data.filter((d) => d.shortage > 0).length
   const avgSpotPrice    = data.reduce((s, d) => s + d.hourlyPrice, 0) / 24
 
+  const penaltyMult   = confidence === "P90" ? 2.2 : 1.8
+  const imbalanceTotal = data.reduce((s, d) => {
+    if (d.shortage > 0.1) return s + d.shortage * d.hourlyPrice * penaltyMult
+    return s
+  }, 0)
+  const imbalanceTotalP50 = data.reduce((s, d) => {
+    if (d.shortage > 0.1) return s + d.shortage * d.hourlyPrice * 1.8
+    return s
+  }, 0)
+  const p90Delta = imbalanceTotal - imbalanceTotalP50
+
   return (
     <div className="flex flex-col gap-6">
 
@@ -154,6 +165,36 @@ export function SidebarControls({
             </p>
           </div>
         </div>
+      </div>
+
+      {/* ── Imbalance Cost KPI ──────────────────────────────────────── */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="mb-3 flex items-center justify-between">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+            Imbalance Cost
+          </p>
+          <span
+            className="cursor-help text-[10px] text-slate-400 underline decoration-dotted"
+            title={`Shortage exposure at ${penaltyMult}× DA spot — typical imbalance penalty rate`}
+          >
+            {confidence === "P90" ? "P90 · 2.2×" : "P50 · 1.8×"}
+          </span>
+        </div>
+        <div className="text-2xl font-bold tracking-tighter text-slate-900">
+          €{imbalanceTotal.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        </div>
+        <p className="mt-1 text-[10px] text-slate-500">
+          Penalty exposure (shortage × {penaltyMult}× DA price)
+        </p>
+        {confidence === "P90" && p90Delta > 0 && (
+          <div className="mt-3 rounded-lg bg-amber-50 p-2.5">
+            <p className="text-[10px] text-amber-700">
+              P90 stress delta:{" "}
+              <span className="font-semibold">+€{p90Delta.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+              {" "}vs P50
+            </p>
+          </div>
+        )}
       </div>
 
     </div>

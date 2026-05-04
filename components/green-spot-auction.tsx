@@ -25,11 +25,22 @@ import {
   Moon,
   MoreHorizontal,
   RefreshCw,
+  Shield,
   Sun,
   Upload,
   X,
   Zap,
 } from "lucide-react"
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+  CommandShortcut,
+} from "@/components/ui/command"
 import { List as VirtualList } from "react-window"
 import {
   DropdownMenu,
@@ -165,6 +176,7 @@ function parseDraft(raw: string | null): {
   hourlyBids: HourlyBidRow[]
   marketType: MarketType
   currentStep: number
+  deliveryDate?: string
 } | null {
   if (!raw) return null
   try {
@@ -172,6 +184,7 @@ function parseDraft(raw: string | null): {
       hourlyBids?: HourlyBidRow[]
       marketType?: MarketType
       currentStep?: number
+      deliveryDate?: string
     }
     if (!Array.isArray(parsed.hourlyBids)) return null
     const len = parsed.hourlyBids.length
@@ -190,7 +203,8 @@ function parseDraft(raw: string | null): {
     const currentStep =
       typeof parsed.currentStep === "number" && parsed.currentStep >= 1 && parsed.currentStep <= 4
         ? parsed.currentStep : 2
-    return { hourlyBids, marketType: mt0, currentStep }
+    const deliveryDate = typeof parsed.deliveryDate === "string" ? parsed.deliveryDate : undefined
+    return { hourlyBids, marketType: mt0, currentStep, deliveryDate }
   } catch { return null }
 }
 
@@ -209,7 +223,7 @@ function getSectionSlotRange(sec: (typeof SECTIONS)[number], isIntraday: boolean
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
-function OtarkStepIndicator({
+function EnergyStepIndicator({
   isCompleted,
   isCurrent,
 }: {
@@ -234,7 +248,7 @@ function OtarkStepIndicator({
   return <div className="h-8 w-8 shrink-0 rounded-full border border-gray-200 bg-white" />
 }
 
-function OtarkCheckbox({
+function EnergyCheckbox({
   checked,
   onChange,
   ariaLabel,
@@ -278,6 +292,15 @@ export function GreenSpotAuction() {
   const [gateCountdown, setGateCountdown] = useState("--:--:--")
   const [lastBidDate, setLastBidDate] = useState<string | null>(null)
   const [submitted, setSubmitted] = useState(false)
+  const deliveryDate = useMemo(() => {
+    const t = new Date()
+    t.setDate(t.getDate() + 1)
+    return t.toISOString().split("T")[0]
+  }, [])
+  const [remitChecks, setRemitChecks] = useState<[boolean, boolean, boolean]>([false, false, false])
+  const [submissionTimestamp, setSubmissionTimestamp] = useState("")
+  const [bidHash, setBidHash] = useState<string | null>(null)
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false)
   const [confidence,   setConfidence]   = useState<ConfidenceLevel>("P50")
   const [weatherModel, setWeatherModel] = useState<WeatherModel>("ECMWF")
 
@@ -285,6 +308,7 @@ export function GreenSpotAuction() {
   const mobileFieldRef = useRef<BidField>("volume")
   const listWrapRef = useRef<HTMLDivElement>(null)
   const blurClearRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const loadMWRef = useRef<number[]>([])
 
   const isIntraday = marketType === "intraday"
   const mwhMultiplier = isIntraday ? 0.25 : 1
@@ -379,11 +403,50 @@ export function GreenSpotAuction() {
 
   useEffect(() => {
     if (!draftHydrated || typeof window === "undefined") return
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hourlyBids, marketType, currentStep, savedAt: new Date().toISOString() }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hourlyBids, marketType, currentStep, deliveryDate, savedAt: new Date().toISOString() }))
     if (draftSavedTimerRef.current) clearTimeout(draftSavedTimerRef.current)
     setDraftSaved(true)
     draftSavedTimerRef.current = setTimeout(() => setDraftSaved(false), 1800)
   }, [hourlyBids, marketType, currentStep, draftHydrated])
+
+  // Live submission timestamp — only ticks when Step 4 is visible
+  useEffect(() => {
+    if (currentStep !== 4) return
+    const update = () => {
+      const now = new Date()
+      const local = now.toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      const utcH = now.getUTCHours().toString().padStart(2, "0")
+      const utcM = now.getUTCMinutes().toString().padStart(2, "0")
+      setSubmissionTimestamp(`${local} (${utcH}:${utcM} UTC)`)
+    }
+    update()
+    const id = setInterval(update, 1000)
+    return () => clearInterval(id)
+  }, [currentStep])
+
+  // Bid hash — SHA-256 of active rows, recomputed when bids change on Step 4
+  useEffect(() => {
+    if (currentStep !== 4) return
+    const active = hourlyBids.filter((b) => b.volume > 0 && b.price !== null)
+    if (active.length === 0) { setBidHash(null); return }
+    const encoded = new TextEncoder().encode(JSON.stringify(active))
+    crypto.subtle.digest("SHA-256", encoded).then((buf) => {
+      const hex = Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("")
+      setBidHash(hex.slice(0, 12))
+    })
+  }, [hourlyBids, currentStep])
+
+  // ⌘K global shortcut
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault()
+        setIsPaletteOpen((prev) => !prev)
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [])
 
   // ── Derived ────────────────────────────────────────────────────────────────
 
@@ -408,7 +471,7 @@ export function GreenSpotAuction() {
   // Step 1: ready to proceed when source is chosen (csv requires a file)
   const dataReady = dataSource !== null && (dataSource !== "csv" || csvFile !== null)
 
-  // 24 hourly load values passed to the Gap Analysis chart
+  // 24 hourly load values derived from current bid volumes
   const loadMW = useMemo((): number[] => {
     if (!isIntraday) return hourlyBids.map((b) => b.volume)
     return Array.from({ length: 24 }, (_, h) => {
@@ -417,8 +480,19 @@ export function GreenSpotAuction() {
     })
   }, [hourlyBids, isIntraday])
 
-  // Gap analysis data — single source of truth for Step 3
-  const gapData = useGapData(loadMW, confidence, weatherModel)
+  // Always keep the ref in sync so effect callbacks can read the latest value
+  loadMWRef.current = loadMW
+
+  // Frozen load snapshot — captured when entering step 2, never updated by bid edits.
+  // This breaks the circular dependency: syncing MW changes bids but not the gap.
+  const [loadSnapshot, setLoadSnapshot] = useState<number[]>(() => Array(24).fill(0))
+
+  useEffect(() => {
+    if (currentStep === 2) setLoadSnapshot(loadMWRef.current)
+  }, [currentStep])
+
+  // Gap analysis data — uses stable load snapshot, not live bid volumes
+  const gapData = useGapData(loadSnapshot, confidence, weatherModel)
 
   // At least one row with both fields filled
   const canContinue = useMemo(
@@ -524,6 +598,24 @@ export function GreenSpotAuction() {
     setHourlyBids(createDefaultBids(marketType))
     setSelectedRows(new Set())
   }
+
+  const formatDeliveryDate = (iso: string) => {
+    try {
+      return new Date(iso + "T00:00:00").toLocaleDateString("en-GB", {
+        weekday: "short", day: "numeric", month: "short", year: "numeric",
+      })
+    } catch { return iso }
+  }
+
+  const handleSubmit = useCallback(() => {
+    setSubmitted(true)
+    try {
+      const key = STORAGE_KEY + "-attestations"
+      const existing = JSON.parse(localStorage.getItem(key) ?? "[]") as object[]
+      existing.push({ hash: bidHash, timestamp: new Date().toISOString(), traderEmail: "kolesnikova@lux-medien.com", acerCode: "B0001234.DE" })
+      localStorage.setItem(key, JSON.stringify(existing))
+    } catch { /* ignore */ }
+  }, [bidHash])
 
   // ── Strategy presets ──────────────────────────────────────────────────────
 
@@ -639,13 +731,15 @@ export function GreenSpotAuction() {
 
   const StepperContentDesktop = (
     <>
-      <div className="mb-6 flex shrink-0 items-center gap-3 md:mb-8">
-        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
-          <Zap className="h-5 w-5" />
-        </div>
-        <div>
-          <h2 className="text-lg font-bold text-foreground">Green SPOT</h2>
-          <p className="text-xs text-muted-foreground">Auction Portal</p>
+      <div className="mb-6 shrink-0 md:mb-8">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
+            <Zap className="h-5 w-5" />
+          </div>
+          <div>
+            <h2 className="text-lg font-bold text-foreground">DAY-AHEAD</h2>
+            <p className="text-xs text-muted-foreground">Auction Portal</p>
+          </div>
         </div>
       </div>
 
@@ -653,15 +747,13 @@ export function GreenSpotAuction() {
         {STEPS.map((step, index) => {
           const isCompleted = step.id < currentStep
           const isCurrent = step.id === currentStep
+          const isClickable = isCompleted || isCurrent
           const isLast = index === STEPS.length - 1
-          return (
-            <div
-              key={step.id}
-              className={cn("flex w-full gap-4", !isLast && "pb-2")}
-              aria-current={isCurrent ? "step" : undefined}
-            >
+
+          const inner = (
+            <>
               <div className="flex w-8 shrink-0 flex-col items-center">
-                <OtarkStepIndicator stepId={step.id} isCompleted={isCompleted} isCurrent={isCurrent} />
+                <EnergyStepIndicator stepId={step.id} isCompleted={isCompleted} isCurrent={isCurrent} />
                 {!isLast && <span className="mt-2 block min-h-[2rem] w-px shrink-0 bg-gray-100" aria-hidden />}
               </div>
               <div className={cn("min-w-0 flex-1 pt-0.5", !isLast && "pb-6")}>
@@ -670,6 +762,22 @@ export function GreenSpotAuction() {
                 </p>
                 <p className="mt-1 text-xs leading-snug text-muted-foreground">{step.description}</p>
               </div>
+            </>
+          )
+
+          return isClickable ? (
+            <button
+              key={step.id}
+              type="button"
+              onClick={() => setCurrentStep(step.id)}
+              className={cn("flex w-full gap-4 text-left rounded-lg transition-colors hover:bg-gray-50/80", !isLast && "pb-2")}
+              aria-current={isCurrent ? "step" : undefined}
+            >
+              {inner}
+            </button>
+          ) : (
+            <div key={step.id} className={cn("flex w-full gap-4", !isLast && "pb-2")}>
+              {inner}
             </div>
           )
         })}
@@ -733,7 +841,7 @@ export function GreenSpotAuction() {
             )}
           >
             <div className="sticky left-0 z-[2] flex w-[76px] shrink-0 flex-col justify-center gap-1 border-r border-gray-200 bg-white px-2 py-2 pl-3 shadow-[4px_0_12px_-4px_rgba(0,0,0,0.08)]">
-              <OtarkCheckbox
+              <EnergyCheckbox
                 checked={isSelected}
                 onChange={() => toggleRowSelection(index)}
                 ariaLabel={`Select ${bid.hour}`}
@@ -847,7 +955,7 @@ export function GreenSpotAuction() {
         >
           {/* Select */}
           <div className="flex justify-center">
-            <OtarkCheckbox
+            <EnergyCheckbox
               checked={isSelected}
               onChange={() => toggleRowSelection(index)}
               ariaLabel={`Select row ${bid.hour}`}
@@ -1340,7 +1448,9 @@ export function GreenSpotAuction() {
           </div>
           <div>
             <h2 className="text-xl font-bold text-foreground">Bid Submitted</h2>
-            <p className="mt-1 text-sm text-muted-foreground">Your bid has been sent to the exchange</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Delivery: {formatDeliveryDate(deliveryDate)}
+            </p>
           </div>
           <div className="rounded-xl border border-primary/20 bg-primary/5 px-8 py-5">
             <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Total Volume</p>
@@ -1348,6 +1458,11 @@ export function GreenSpotAuction() {
             <p className="mt-1 text-xs text-muted-foreground">
               Est. max spend · €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </p>
+            {bidHash && (
+              <p className="mt-2 font-mono text-[10px] text-muted-foreground/60">
+                Audit ID: {bidHash}
+              </p>
+            )}
           </div>
           <button
             type="button"
@@ -1367,7 +1482,8 @@ export function GreenSpotAuction() {
           <div>
             <h1 className="text-lg font-bold text-foreground sm:text-xl">Review Bid</h1>
             <p className="text-xs text-muted-foreground sm:text-sm">
-              {activeRows.length} active {activeRows.length === 1 ? "slot" : "slots"} · {totalVolume.toFixed(2)} MWh
+              Delivery: <span className="font-medium text-foreground">{formatDeliveryDate(deliveryDate)}</span>
+              {" · "}{activeRows.length} active {activeRows.length === 1 ? "slot" : "slots"} · {totalVolume.toFixed(2)} MWh
             </p>
           </div>
           <button type="button" onClick={() => setIsOpen(false)} className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-gray-100" aria-label="Close">
@@ -1414,6 +1530,64 @@ export function GreenSpotAuction() {
                 </table>
               </div>
 
+              {/* REMIT Compliance Check */}
+              <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-5">
+                <div className="mb-4 flex items-center gap-2">
+                  <Shield className="h-4 w-4 text-amber-600" />
+                  <p className="text-sm font-semibold text-foreground">REMIT Compliance Check</p>
+                </div>
+                <div className="space-y-3">
+                  {([
+                    "I confirm no inside information impacts these bids (REMIT Art. 3)",
+                    "Bid prices reflect genuine commercial intent and are not designed to manipulate price formation (REMIT Art. 5)",
+                    "Volumes match my forecasted load — no wash trading or fictitious orders",
+                  ] as const).map((label, i) => (
+                    <label key={i} className="flex cursor-pointer items-start gap-3">
+                      <EnergyCheckbox
+                        checked={remitChecks[i]}
+                        onChange={(v) => {
+                          const next: [boolean, boolean, boolean] = [remitChecks[0], remitChecks[1], remitChecks[2]]
+                          next[i] = v
+                          setRemitChecks(next)
+                        }}
+                        ariaLabel={label}
+                      />
+                      <span className="text-xs leading-relaxed text-foreground">{label}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2.5 border-t border-amber-200/60 pt-3.5">
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Trader</p>
+                    <p className="mt-0.5 font-mono text-xs text-foreground">kolesnikova@lux-medien.com</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">ACER Code</p>
+                    <p className="mt-0.5 font-mono text-xs text-foreground">B0001234.DE</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Submission Time</p>
+                    <p className="mt-0.5 font-mono text-xs text-foreground">{submissionTimestamp || "—"}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Bid Hash</p>
+                    <div className="mt-0.5 flex items-center gap-1.5">
+                      <p className="font-mono text-xs text-foreground">{bidHash ? `${bidHash}…` : "—"}</p>
+                      {bidHash && (
+                        <button
+                          type="button"
+                          onClick={() => navigator.clipboard.writeText(bidHash)}
+                          className="flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                          aria-label="Copy bid hash"
+                        >
+                          <Copy className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               {/* Exposure summary card */}
               <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-5">
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-primary/60">Exposure Summary</p>
@@ -1453,8 +1627,8 @@ export function GreenSpotAuction() {
           </button>
           <button
             type="button"
-            onClick={() => setSubmitted(true)}
-            disabled={activeRows.length === 0}
+            onClick={handleSubmit}
+            disabled={activeRows.length === 0 || !remitChecks.every(Boolean)}
             className="rounded-xl bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Submit Bid to Exchange
@@ -1474,7 +1648,7 @@ export function GreenSpotAuction() {
           onClick={() => setIsOpen(true)}
           className="rounded-lg bg-primary px-8 py-4 text-lg font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90"
         >
-          Open Green SPOT Auction
+          Open Day-Ahead Auction
         </button>
       </div>
     )
@@ -1642,13 +1816,116 @@ export function GreenSpotAuction() {
           </button>
           <button
             type="button"
-            onClick={() => setSubmitted(true)}
-            className="flex-1 rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow-sm"
+            onClick={handleSubmit}
+            disabled={!remitChecks.every(Boolean)}
+            className="flex-1 rounded-xl bg-primary py-3 text-sm font-semibold text-primary-foreground shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
           >
             Submit to Exchange
           </button>
         </div>
       )}
+
+      {/* ⌘K Command Palette */}
+      <CommandDialog open={isPaletteOpen} onOpenChange={setIsPaletteOpen}>
+        <CommandInput placeholder="Search commands…" />
+        <CommandList>
+          <CommandEmpty>No results found.</CommandEmpty>
+
+          <CommandGroup heading="Navigate">
+            <CommandItem onSelect={() => { setCurrentStep(1); setIsPaletteOpen(false) }}>
+              Go to Data Setup <CommandShortcut>1</CommandShortcut>
+            </CommandItem>
+            <CommandItem
+              disabled={!dataReady}
+              onSelect={() => { if (dataReady) { setCurrentStep(2); setIsPaletteOpen(false) } }}
+            >
+              Go to Gap Analysis <CommandShortcut>2</CommandShortcut>
+            </CommandItem>
+            <CommandItem onSelect={() => { setCurrentStep(3); setIsPaletteOpen(false) }}>
+              Go to Bid Entry <CommandShortcut>3</CommandShortcut>
+            </CommandItem>
+            <CommandItem
+              disabled={!canContinue}
+              onSelect={() => { if (canContinue) { setCurrentStep(4); setIsPaletteOpen(false) } }}
+            >
+              Go to Review <CommandShortcut>4</CommandShortcut>
+            </CommandItem>
+          </CommandGroup>
+
+          <CommandSeparator />
+
+          <CommandGroup heading="Market">
+            <CommandItem onSelect={() => { handleMarketTypeChange("day-ahead"); setIsPaletteOpen(false) }}>
+              Switch to Day-Ahead
+            </CommandItem>
+            <CommandItem onSelect={() => { handleMarketTypeChange("intraday"); setIsPaletteOpen(false) }}>
+              Switch to Intraday
+            </CommandItem>
+          </CommandGroup>
+
+          {currentStep === 3 && (
+            <>
+              <CommandSeparator />
+              <CommandGroup heading="Quick Fill">
+                <CommandItem onSelect={() => { handlePresetBaseLoad(); setIsPaletteOpen(false) }}>
+                  Apply Base Load preset
+                </CommandItem>
+                <CommandItem onSelect={() => { handlePresetPeakHours(); setIsPaletteOpen(false) }}>
+                  Apply Peak Hours preset
+                </CommandItem>
+                <CommandItem onSelect={() => { handleSyncVolumesToGap(); setIsPaletteOpen(false) }}>
+                  Sync volumes to gap
+                </CommandItem>
+                <CommandItem onSelect={() => { handleInitPrices(); setIsPaletteOpen(false) }}>
+                  Init prices at ref +5%
+                </CommandItem>
+                <CommandItem
+                  className="text-red-600 aria-selected:text-red-600"
+                  onSelect={() => { handleClearAll(); setIsPaletteOpen(false) }}
+                >
+                  Clear all bids
+                </CommandItem>
+              </CommandGroup>
+              <CommandSeparator />
+              <CommandGroup heading="Jump to Hour">
+                {Array.from({ length: 24 }, (_, h) => {
+                  const hStr = h.toString().padStart(2, "0")
+                  const eStr = ((h + 1) % 24).toString().padStart(2, "0")
+                  const idx = isIntraday ? h * 4 : h
+                  return (
+                    <CommandItem
+                      key={h}
+                      value={`focus ${hStr}:00`}
+                      onSelect={() => { focusHourAtField(idx, "volume"); setIsPaletteOpen(false) }}
+                    >
+                      Focus {hStr}:00 – {eStr}:00
+                    </CommandItem>
+                  )
+                })}
+              </CommandGroup>
+            </>
+          )}
+
+          {currentStep === 4 && !submitted && (
+            <>
+              <CommandSeparator />
+              <CommandGroup heading="Actions">
+                <CommandItem
+                  disabled={!remitChecks.every(Boolean)}
+                  onSelect={() => { if (remitChecks.every(Boolean)) { handleSubmit(); setIsPaletteOpen(false) } }}
+                >
+                  Submit bid to exchange
+                </CommandItem>
+              </CommandGroup>
+            </>
+          )}
+        </CommandList>
+        <div className="flex gap-4 border-t px-3 py-2 text-[11px] text-muted-foreground">
+          <span><kbd className="font-mono">↑↓</kbd> navigate</span>
+          <span><kbd className="font-mono">↵</kbd> run</span>
+          <span><kbd className="font-mono">Esc</kbd> close</span>
+        </div>
+      </CommandDialog>
     </div>
   )
 }

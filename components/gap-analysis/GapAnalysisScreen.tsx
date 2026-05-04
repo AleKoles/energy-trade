@@ -113,6 +113,9 @@ export function GapAnalysisScreen({
 
           {/* Hourly breakdown strip — compact heat-row */}
           <HourlyStrip data={data} />
+
+          {/* Imbalance cost strip */}
+          <ImbalanceStrip data={data} confidence={confidence} />
         </div>
 
         {/* Sidebar controls */}
@@ -163,6 +166,67 @@ export function GapAnalysisScreen({
         </button>
       </div>
 
+    </div>
+  )
+}
+
+// ─── Imbalance exposure strip ─────────────────────────────────────────────────
+
+function ImbalanceStrip({ data, confidence }: { data: GapDataPoint[]; confidence: ConfidenceLevel }) {
+  const penaltyMult   = confidence === "P90" ? 2.2 : 1.8
+  const surplusHaircut = confidence === "P90" ? 0.35 : 0.4
+
+  const costs = data.map((d) => {
+    if (d.shortage > 0.1) return d.shortage * d.hourlyPrice * penaltyMult
+    if (d.surplus  > 0.1) return -(d.surplus  * d.hourlyPrice * surplusHaircut)
+    return 0
+  })
+
+  const worstCase = costs.filter((c) => c > 0).reduce((s, c) => s + c, 0)
+  const net       = costs.reduce((s, c) => s + c, 0)
+  const maxAbs    = Math.max(...costs.map((c) => Math.abs(c)), 1)
+
+  return (
+    <div>
+      <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+        Imbalance Exposure
+      </p>
+      <div className="flex h-12 items-end gap-px overflow-hidden rounded-lg">
+        {costs.map((cost, i) => {
+          const intensity = Math.abs(cost) / maxAbs
+          const h = Math.max(intensity * 46, 2)
+          const bg = cost > 0
+            ? `rgba(248,113,113,${(0.4 + intensity * 0.55).toFixed(2)})`
+            : cost < 0
+              ? `rgba(52,211,153,${(0.4 + intensity * 0.55).toFixed(2)})`
+              : "rgb(209,213,219)"
+          return (
+            <div
+              key={i}
+              className="flex flex-1 cursor-default items-end"
+              title={`${data[i].time}: €${Math.abs(cost).toFixed(0)} imbalance risk`}
+            >
+              <div className="w-full rounded-sm" style={{ height: `${h}px`, background: bg }} />
+            </div>
+          )
+        })}
+      </div>
+      <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+        <span>00:00</span><span>12:00</span><span>24:00</span>
+      </div>
+      <p className="mt-2 text-[10px] text-muted-foreground">
+        Worst-case:{" "}
+        <span className="font-semibold text-red-500">
+          €{worstCase.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        </span>
+        {" · "}Net:{" "}
+        <span className={cn("font-semibold", net > 0 ? "text-red-500" : "text-emerald-600")}>
+          €{net.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        </span>
+        {confidence === "P90" && (
+          <span className="ml-2 text-amber-600">(P90 stress: {penaltyMult}× DA)</span>
+        )}
+      </p>
     </div>
   )
 }

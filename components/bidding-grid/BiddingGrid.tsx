@@ -11,10 +11,11 @@ import {
   type RefObject,
 } from "react"
 import { AnimatePresence, motion } from "framer-motion"
-import { AlertCircle, ChevronLeft, ChevronRight, Copy } from "lucide-react"
+import { AlertCircle, ChevronLeft, ChevronRight, Copy, TrendingUp, X } from "lucide-react"
 import { List as VirtualList } from "react-window"
 import { cn } from "@/lib/utils"
 import type { GapDataPoint } from "@/components/gap-analysis/useGapData"
+import { getPortfolioPositions } from "@/lib/portfolio"
 import { HeaderControls } from "./HeaderControls"
 import { BulkActionBar } from "./BulkActionBar"
 import { BiddingRow, type BidField } from "./BiddingRow"
@@ -70,6 +71,107 @@ export interface BiddingGridProps {
   onClose: () => void
 }
 
+// ─── Position side panel ─────────────────────────────────────────────────────
+
+interface HourPos {
+  hour: number
+  forecastLoad: number
+  ppaCovered: number
+  alreadyHedged: number
+  activeBidMW: number
+  netOpen: number
+}
+
+function PositionSidePanel({
+  positions,
+  netOpenTotal,
+  coverageRatio,
+  worstCaseSpend,
+  onHoverHour,
+  onClose,
+}: {
+  positions: HourPos[]
+  netOpenTotal: number
+  coverageRatio: number
+  worstCaseSpend: number
+  onHoverHour: (hour: number) => void
+  onClose: () => void
+}) {
+  const maxAbs = Math.max(...positions.map((p) => Math.abs(p.netOpen)), 1)
+  const isLong = netOpenTotal <= 0
+  return (
+    <div className="w-64 shrink-0 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
+      <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3">
+        <div className="flex items-center gap-1.5">
+          <TrendingUp className="h-3.5 w-3.5 text-primary" />
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Position</p>
+        </div>
+        <button type="button" onClick={onClose} className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-gray-100">
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      <div className="space-y-4 p-4">
+        <div>
+          <p className="text-[10px] text-muted-foreground">Net Open Position</p>
+          <p className={cn("mt-0.5 text-xl font-bold tabular-nums", isLong ? "text-emerald-600" : "text-red-500")}>
+            {netOpenTotal > 0 ? "+" : ""}{netOpenTotal.toFixed(1)}{" "}
+            <span className="text-xs font-normal text-muted-foreground">MWh</span>
+          </p>
+          <p className={cn("text-[10px]", isLong ? "text-emerald-500" : "text-red-400")}>
+            {isLong ? "Long — over-hedged" : "Unhedged — buy required"}
+          </p>
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between">
+            <p className="text-[10px] text-muted-foreground">Coverage Ratio</p>
+            <p className="text-xs font-semibold tabular-nums text-foreground">{coverageRatio.toFixed(1)}%</p>
+          </div>
+          <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-gray-100">
+            <div
+              className={cn(
+                "h-full rounded-full transition-all duration-500",
+                coverageRatio >= 80 ? "bg-emerald-400" : coverageRatio >= 50 ? "bg-amber-400" : "bg-red-400"
+              )}
+              style={{ width: `${Math.min(coverageRatio, 100)}%` }}
+            />
+          </div>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-muted-foreground">Worst-case Spend</p>
+          <p className="mt-0.5 text-sm font-semibold tabular-nums text-foreground">
+            €{worstCaseSpend.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          </p>
+        </div>
+      </div>
+
+      <div className="border-t border-gray-100 px-4 pb-4 pt-3">
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          Hourly Net Open
+        </p>
+        <div className="flex h-10 items-end gap-px">
+          {positions.map((p, i) => {
+            const h = (Math.abs(p.netOpen) / maxAbs) * 38
+            const color = p.netOpen > 5 ? "bg-red-400/70" : p.netOpen < -5 ? "bg-emerald-400/70" : "bg-gray-300"
+            return (
+              <div
+                key={i}
+                className="flex-1 cursor-pointer"
+                onMouseEnter={() => onHoverHour(i)}
+                title={`${String(i).padStart(2, "0")}:00 · ${p.netOpen > 0 ? "+" : ""}${p.netOpen.toFixed(1)} MW`}
+              >
+                <div className={cn("w-full rounded-sm", color)} style={{ height: `${Math.max(h, 2)}px` }} />
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function BiddingGrid({
@@ -89,8 +191,47 @@ export function BiddingGrid({
   const [selectedRows, setSelectedRows]       = useState<ReadonlySet<number>>(new Set())
   const [flashedRows,  setFlashedRows]        = useState<ReadonlySet<number>>(new Set())
   const [mobileFocusIndex, setMobileFocusIndex] = useState<number | null>(null)
+  const [showPositionPanel, setShowPositionPanel] = useState(true)
   const mobileFieldRef = useRef<BidField>("volume")
   const blurClearRef   = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ── Portfolio / position data ───────────────────────────────────────────────
+
+  const portfolio = useMemo(() => getPortfolioPositions(), [])
+
+  const hourlyPositions = useMemo((): HourPos[] =>
+    portfolio.map((pos, h) => {
+      let activeBidMW = 0
+      if (isIntraday) {
+        for (let q = 0; q < 4; q++) {
+          const slot = hourlyBids[h * 4 + q]
+          if (slot && slot.volume > 0 && slot.price !== null) activeBidMW += slot.volume
+        }
+        activeBidMW /= 4
+      } else {
+        const slot = hourlyBids[h]
+        if (slot && slot.volume > 0 && slot.price !== null) activeBidMW = slot.volume
+      }
+      const netOpen = pos.forecastLoad - pos.ppaCovered - pos.alreadyHedged - activeBidMW
+      return { ...pos, activeBidMW, netOpen: Math.round(netOpen * 10) / 10 }
+    }),
+    [portfolio, hourlyBids, isIntraday]
+  )
+
+  const positionTotals = useMemo(() => {
+    const totalLoad    = hourlyPositions.reduce((s, p) => s + p.forecastLoad, 0)
+    const totalCovered = hourlyPositions.reduce((s, p) => s + p.ppaCovered + p.alreadyHedged + p.activeBidMW, 0)
+    const netOpenTotal = hourlyPositions.reduce((s, p) => s + p.netOpen, 0)
+    const coverageRatio = totalLoad > 0 ? (totalCovered / totalLoad) * 100 : 0
+    const worstCaseSpend = hourlyBids.reduce((s, b) => {
+      return b.volume > 0 && b.price !== null ? s + b.volume * mwhMultiplier * b.price : s
+    }, 0)
+    return {
+      netOpenTotal: Math.round(netOpenTotal * 10) / 10,
+      coverageRatio: Math.round(coverageRatio * 10) / 10,
+      worstCaseSpend,
+    }
+  }, [hourlyPositions, hourlyBids, mwhMultiplier])
 
   // ── Smart price init on first mount ────────────────────────────────────────
   useEffect(() => {
@@ -182,6 +323,11 @@ export function BiddingGrid({
     onApplyFirstToAll()
     flashRows(new Set(Array.from({ length: slotCount - 1 }, (_, k) => k + 1)))
   }, [onApplyFirstToAll, slotCount, flashRows])
+
+  const handlePositionHover = useCallback((hour: number) => {
+    const idx = isIntraday ? hour * 4 : hour
+    document.querySelector<HTMLElement>(`[data-bid-input="volume-${idx}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" })
+  }, [isIntraday])
 
   // ── Mobile focus handlers ─────────────────────────────────────────────────────
   const focusHourAtField = useCallback((index: number, field: BidField) => {
@@ -329,6 +475,21 @@ export function BiddingGrid({
         >
           Clear All
         </button>
+        <div className="ml-auto">
+          <button
+            type="button"
+            onClick={() => setShowPositionPanel((v) => !v)}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
+              showPositionPanel
+                ? "bg-primary/10 text-primary"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+            )}
+          >
+            <TrendingUp className="h-3.5 w-3.5" />
+            Position
+          </button>
+        </div>
       </div>
 
       {/* Bulk action bar (when rows are selected) */}
@@ -406,7 +567,19 @@ export function BiddingGrid({
                 style={{ height: listHeight, width: "100%" }}
               />
             ) : (
-              renderDesktopTable()
+              <div className="flex items-start gap-4">
+                <div className="min-w-0 flex-1">{renderDesktopTable()}</div>
+                {showPositionPanel && (
+                  <PositionSidePanel
+                    positions={hourlyPositions}
+                    netOpenTotal={positionTotals.netOpenTotal}
+                    coverageRatio={positionTotals.coverageRatio}
+                    worstCaseSpend={positionTotals.worstCaseSpend}
+                    onHoverHour={handlePositionHover}
+                    onClose={() => setShowPositionPanel(false)}
+                  />
+                )}
+              </div>
             )}
           </motion.div>
         </AnimatePresence>
@@ -416,28 +589,26 @@ export function BiddingGrid({
       <div className="hidden shrink-0 flex-col gap-2.5 border-t border-gray-200 bg-white px-6 py-3.5 sm:px-8 md:flex lg:flex-row lg:items-center lg:justify-between lg:gap-3 lg:py-4">
 
         {/* Stats */}
-        <div className="flex items-center gap-2">
-          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
-            <p className="text-[10px] text-muted-foreground">Total Volume</p>
-            <p className="text-sm font-bold text-foreground lg:text-base">
-              {totalVolume.toFixed(2)} MWh
-            </p>
-          </div>
-          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
-            <p className="text-[10px] text-muted-foreground">Est. max spend</p>
-            <p className="text-sm font-bold text-foreground lg:text-base">
-              €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </p>
-          </div>
-          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5">
-            <p className="text-[10px] text-muted-foreground">Active slots</p>
-            <p className="text-sm font-bold text-foreground lg:text-base">
-              {filledSlots} / {slotCount}
-            </p>
+        <div className="flex items-center gap-4">
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 space-y-1">
+            <div className="flex items-center gap-1.5">
+              <span className="w-24 text-[10px] text-muted-foreground">Total Volume</span>
+              <span className="text-xs font-bold text-foreground">{totalVolume.toFixed(2)} MWh</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-24 text-[10px] text-muted-foreground">Est. max spend</span>
+              <span className="text-xs font-bold text-foreground">
+                €{estimatedMaxSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-24 text-[10px] text-muted-foreground">Active slots</span>
+              <span className="text-xs font-bold text-foreground">{filledSlots} / {slotCount}</span>
+            </div>
           </div>
           <span
             className={cn(
-              "ml-1 text-[10px] font-medium transition-opacity duration-500",
+              "text-[10px] font-medium transition-opacity duration-500",
               draftSaved ? "text-emerald-600 opacity-100" : "opacity-0"
             )}
             aria-live="polite"
@@ -467,7 +638,7 @@ export function BiddingGrid({
             <button
               type="button"
               onClick={onBack}
-              className="rounded-lg px-4 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground lg:px-6"
+              className="rounded-xl px-4 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-white lg:px-6"
             >
               Back
             </button>

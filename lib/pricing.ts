@@ -1,5 +1,5 @@
 /**
- * Market reference price simulation for Green SPOT Auction.
+ * Market reference price simulation for Day-Ahead Auction.
  * Models a realistic solar/wind generation curve (€/MWh).
  *
  * All variation is deterministic (sine-based) — prices are stable across renders.

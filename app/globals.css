@@ -4,7 +4,7 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  /* Otark reference: page bg neutral gray, modal white, borders gray-200 */
+  /* page bg neutral gray, modal white, borders gray-200 */
   --background: #f3f4f6;
   --foreground: #111827;
   --card: #ffffff;
@@ -14,10 +14,10 @@
   /* Electric blue — energy brand color */
   --primary: #1264a8;
   --primary-foreground: #ffffff;
-  --otark-accent: var(--primary);
-  --otark-info: #5cb4d5;
-  --otark-success: #34d399;
-  --otark-warning: #ffdc45;
+  --energy-accent: var(--primary);
+  --energy-info: #5cb4d5;
+  --energy-success: #34d399;
+  --energy-warning: #ffdc45;
   --secondary: #f3f4f6;
   --secondary-foreground: #111827;
   --muted: #f3f4f6;
@@ -55,7 +55,7 @@
   --popover-foreground: oklch(0.97 0.005 85);
   --primary: #1878ce;
   --primary-foreground: #ffffff;
-  --otark-accent: var(--primary);
+  --energy-accent: var(--primary);
   --secondary: oklch(0.25 0.04 260);
   --secondary-foreground: oklch(0.97 0.005 85);
   --muted: oklch(0.25 0.04 260);
@@ -109,10 +109,10 @@
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
   --color-chart-5: var(--chart-5);
-  --color-otark-accent: var(--otark-accent);
-  --color-otark-info: var(--otark-info);
-  --color-otark-success: var(--otark-success);
-  --color-otark-warning: var(--otark-warning);
+  --color-energy-accent: var(--energy-accent);
+  --color-energy-info: var(--energy-info);
+  --color-energy-success: var(--energy-success);
+  --color-energy-warning: var(--energy-warning);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);

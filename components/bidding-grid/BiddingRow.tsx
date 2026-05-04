@@ -1,7 +1,8 @@
 "use client"
 
-import React, { type CSSProperties, type KeyboardEvent } from "react"
-import { ChevronDown } from "lucide-react"
+import React, { useRef, useState, type CSSProperties, type KeyboardEvent } from "react"
+import { ChevronDown, X } from "lucide-react"
+import { generateOrderBook } from "@/lib/orderBook"
 import {
   Tooltip,
   TooltipContent,
@@ -14,6 +15,14 @@ import { cn } from "@/lib/utils"
 export type BidField = "volume" | "price"
 
 type GapStatus = "unmatched" | "matched" | "deviated" | "idle"
+
+export interface BlockBidDisplay {
+  id: string
+  label: string
+  volume: number
+  price: number
+  minFill: 'AON' | 'partial'
+}
 
 export interface BiddingRowProps {
   index:        number
@@ -29,6 +38,7 @@ export interface BiddingRowProps {
   isCompact:    boolean       // true = mobile layout
   isLastRow:    boolean
   style?:       CSSProperties
+  blockBid?:    BlockBidDisplay  // when set, row is read-only block display
   onVolumeChange: (raw: string) => void
   onPriceChange:  (raw: string) => void
   onKeyDown:      (e: KeyboardEvent<HTMLInputElement>, field: BidField) => void
@@ -36,6 +46,7 @@ export interface BiddingRowProps {
   onMobileBlur:   () => void
   onToggleSelect: () => void
   onCopyDown:     () => void
+  onDetachBlock?: () => void
 }
 
 // ─── Gap status logic ─────────────────────────────────────────────────────────
@@ -100,7 +111,7 @@ function GapBadge({ slotGap }: { slotGap: number }) {
   )
 }
 
-// ─── Inline checkbox (avoids importing OtarkCheckbox from parent) ─────────────
+// ─── Inline checkbox (avoids importing EnergyCheckbox from parent) ─────────────
 
 function Checkbox({ checked, onChange, label }: {
   checked: boolean
@@ -152,6 +163,19 @@ function BiddingRowInner({
   const status    = getGapStatus(volume, slotGap)
   const required  = Math.max(slotGap, 0)
   const suggested = refPrice > 0 ? refPrice * 1.05 : null
+
+  const [priceFocused, setPriceFocused] = useState(false)
+  const priceBlurRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const handlePriceFocus = () => {
+    if (priceBlurRef.current) clearTimeout(priceBlurRef.current)
+    setPriceFocused(true)
+  }
+  const handlePriceBlur = () => {
+    priceBlurRef.current = setTimeout(() => setPriceFocused(false), 200)
+  }
+
+  const { levels: orderBook, likelyFillMW } = generateOrderBook(refPrice, price, volume)
 
   // ── Compact (mobile) ────────────────────────────────────────────────────────
 
@@ -281,36 +305,95 @@ function BiddingRowInner({
         <span className="shrink-0 select-none pr-2 text-[10px] text-muted-foreground">MW</span>
       </div>
 
-      {/* Limit Price (€/MWh) */}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div className={cn(
-            "flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition-colors focus-within:ring-2",
-            isDeviating
-              ? "border-amber-300 focus-within:ring-amber-300/40"
-              : "border-gray-200 focus-within:border-primary focus-within:ring-primary/20"
-          )}>
-            <input
-              type="number"
-              data-bid-input={`price-${index}`}
-              placeholder={suggested !== null ? suggested.toFixed(2) : "0.00"}
-              value={price === null ? "" : price}
-              onChange={(e) => onPriceChange(e.target.value)}
-              onKeyDown={(e) => onKeyDown(e, "price")}
-              className="min-w-0 flex-1 bg-transparent py-1.5 pl-2 pr-0.5 text-right text-sm font-medium text-foreground focus:outline-none sm:py-2"
-              step={0.01}
-            />
-            <span className="shrink-0 select-none pr-2 text-[10px] text-muted-foreground">€/MWh</span>
+      {/* Limit Price (€/MWh) + order book panel */}
+      <div className="relative min-w-0">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className={cn(
+              "flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition-colors focus-within:ring-2",
+              isDeviating
+                ? "border-amber-300 focus-within:ring-amber-300/40"
+                : "border-gray-200 focus-within:border-primary focus-within:ring-primary/20"
+            )}>
+              <input
+                type="number"
+                data-bid-input={`price-${index}`}
+                placeholder={suggested !== null ? suggested.toFixed(2) : "0.00"}
+                value={price === null ? "" : price}
+                onChange={(e) => onPriceChange(e.target.value)}
+                onKeyDown={(e) => onKeyDown(e, "price")}
+                onFocus={handlePriceFocus}
+                onBlur={handlePriceBlur}
+                className="min-w-0 flex-1 bg-transparent py-1.5 pl-2 pr-0.5 text-right text-sm font-medium text-foreground focus:outline-none sm:py-2"
+                step={0.01}
+              />
+              <span className="shrink-0 select-none pr-2 text-[10px] text-muted-foreground">€/MWh</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {isDeviating
+              ? "Bid volume deviates from forecasted shortage"
+              : suggested !== null
+                ? `Ref €${refPrice.toFixed(2)} · Suggested €${suggested.toFixed(2)}`
+                : "Enter limit price"}
+          </TooltipContent>
+        </Tooltip>
+
+        {priceFocused && (
+          <div className="absolute left-0 top-full z-30 mt-1 w-52 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg">
+            <div className="border-b border-gray-100 bg-gray-50 px-2.5 py-1.5 text-[10px] text-muted-foreground">
+              Likely fill:{" "}
+              <span className="font-semibold text-foreground">
+                {likelyFillMW.toFixed(1)} / {volume > 0 ? volume.toFixed(1) : "—"} MW
+              </span>
+            </div>
+            <div className="flex divide-x divide-gray-100">
+              <div className="flex-1 bg-sky-50/40 p-1.5">
+                <p className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-sky-600">Bids</p>
+                {orderBook.filter((l) => l.side === "bid").map((l, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "flex items-center justify-between rounded px-1 py-0.5 text-[10px]",
+                      l.isUser && "bg-primary/[0.08]"
+                    )}
+                  >
+                    <span className={cn("tabular-nums", l.isUser && "font-semibold text-primary")}>
+                      {l.price.toFixed(2)}
+                    </span>
+                    {l.isUser ? (
+                      <span className="rounded bg-primary/20 px-1 py-px text-[9px] font-semibold text-primary">YOU</span>
+                    ) : (
+                      <span className="tabular-nums text-muted-foreground">{l.volumeMW} MW</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="flex-1 bg-red-50/30 p-1.5">
+                <p className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-red-500">Asks</p>
+                {orderBook.filter((l) => l.side === "ask").map((l, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "flex items-center justify-between rounded px-1 py-0.5 text-[10px]",
+                      l.isUser && "bg-primary/[0.08]"
+                    )}
+                  >
+                    <span className={cn("tabular-nums", l.isUser && "font-semibold text-primary")}>
+                      {l.price.toFixed(2)}
+                    </span>
+                    {l.isUser ? (
+                      <span className="rounded bg-primary/20 px-1 py-px text-[9px] font-semibold text-primary">YOU</span>
+                    ) : (
+                      <span className="tabular-nums text-muted-foreground">{l.volumeMW} MW</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          {isDeviating
-            ? "Bid volume deviates from forecasted shortage"
-            : suggested !== null
-              ? `Ref €${refPrice.toFixed(2)} · Suggested €${suggested.toFixed(2)}`
-              : "Enter limit price"}
-        </TooltipContent>
-      </Tooltip>
+        )}
+      </div>
 
       {/* Status dot */}
       <div className="flex justify-center">
