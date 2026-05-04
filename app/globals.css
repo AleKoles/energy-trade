@@ -135,7 +135,6 @@
     @apply bg-background text-foreground;
   }
   h1, h2, h3 {
-    font-family: var(--font-space-grotesk, 'Space Grotesk', system-ui, sans-serif);
-    font-feature-settings: "ss01" 1;
+    font-family: var(--font-lexend, 'Lexend', system-ui, sans-serif);
   }
 }
